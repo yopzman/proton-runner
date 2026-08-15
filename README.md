@@ -1,5 +1,6 @@
 # proton-runner
-![alt text](image.png)
+
+![Proton Runner](image.png)
 
 Run auxiliary Windows tools (`.exe`, `.bat`, mod loaders, debugging utilities) and Linux commands inside a Steam game's Proton environment without modifying game launch options.
 
@@ -124,4 +125,4 @@ proton-runner doctor 3513350
 
 ## License
 
-MIT
+This project is licensed under the [MIT License](LICENSE).
