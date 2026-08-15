@@ -8,10 +8,12 @@
 
 set -u
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
 GUI_SCRIPT="$SCRIPT_DIR/proton_runner_gui.py"
+DEBUG="${PROTON_RUNNER_DEBUG:-0}"
+CUSTOM_STEAM_ROOT=""
 
 # --- Output Formatting & Colors ---
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
@@ -117,6 +119,11 @@ get_user_pids() {
 
 # Find potential Steam root paths
 find_steam_roots() {
+    if [[ -n "$CUSTOM_STEAM_ROOT" && -d "$CUSTOM_STEAM_ROOT" ]]; then
+        echo "$CUSTOM_STEAM_ROOT"
+        return 0
+    fi
+
     local candidates=(
         "${XDG_DATA_HOME:-$HOME/.local/share}/Steam"
         "$HOME/.steam/steam"
@@ -1236,6 +1243,22 @@ cmd_version() {
 
 # --- Main Entrypoint ---
 main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --debug)
+                DEBUG=1
+                shift
+                ;;
+            --steam-root)
+                CUSTOM_STEAM_ROOT="$2"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
     if [[ $# -eq 0 ]]; then
         if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
             launch_gui

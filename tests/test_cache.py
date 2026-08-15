@@ -39,8 +39,9 @@ class TestSmartCache(unittest.TestCase):
 
         loaded = SmartCache.load()
         self.assertIsNotNone(loaded)
-        self.assertEqual(len(loaded), 1)
-        self.assertEqual(loaded[0]["appid"], "3513350")
+        games = loaded.get("games", [])
+        self.assertEqual(len(games), 1)
+        self.assertEqual(games[0]["appid"], "3513350")
 
     def test_cache_invalidation_on_mtime_change(self):
         lib = self.base_path / "steam_lib"

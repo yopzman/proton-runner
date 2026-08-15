@@ -12,7 +12,7 @@ class TestCLI(unittest.TestCase):
     def test_version_output(self):
         p = subprocess.run([str(CLI_PATH), "--version"], capture_output=True, text=True)
         self.assertEqual(p.returncode, 0)
-        self.assertIn("proton-runner 0.2.0", p.stdout)
+        self.assertIn("proton-runner 0.3.0", p.stdout)
 
     def test_help_output(self):
         p = subprocess.run([str(CLI_PATH), "--help"], capture_output=True, text=True)

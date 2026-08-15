@@ -10,31 +10,22 @@ Available as both a standalone Bash CLI tool and an ultra-fast, compact Qt6 desk
 
 ---
 
-## What's New in v0.2.0
+## What's New in v0.3.0
 
-- **Instant Window Startup (< 0.15s):** Window renders immediately before background operations.
-- **Progressive Discovery Pipeline:** Non-blocking `QThread` stages discover Steam roots, libraries, game ACF metadata, and Proton tools without freezing the UI.
-- **Smart XDG Caching (`~/.cache/proton-runner/`):** Instant launch (< 1ms) with timestamp and mtime invalidation when libraries or manifests change.
-- **Lazy Detail Inspector:** Detailed Wine prefix and Proton path resolution loaded on-demand per game.
-- **Automated Test Suite:** Comprehensive unit & integration tests (`tests/`) for VDF/ACF parsers, caching, discovery, and CLI subcommands.
+- **Proton Provider Abstraction:** Automatically classifies Proton builds (`Valve Official`, `GE-Proton`, `Proton Experimental`, `Custom / Community`).
+- **Steam Linux Runtime (SLR) & Pressure-Vessel Awareness:** Detects container runtime status (`Container-Attached`, `Direct`, or `Host-Fallback`) with compatibility reports.
+- **GUI Environment Inspector:** Interactive dialog in the GUI with key paths, container status, filesystem types, and a search-filterable environment variable table with 1-click copy.
+- **Flatpak & Multi-Steam Support:** Detects Native and Flatpak Steam installations (`--steam-root <PATH>`).
+- **Filesystem & NTFS Diagnostics:** Detects underlying filesystem types for game directories and compatdata prefixes with NTFS warnings.
+- **Structured Debug Mode:** `--debug` / `PROTON_RUNNER_DEBUG=1` without leaking sensitive credentials or tokens.
+- **Expanded Automated Test Suite:** 27 unit & integration tests covering providers, runtimes, filesystems, parsers, caching, and CLI commands.
 
 ---
 
 ## Requirements
 
-- **CLI Core:** Linux with Bash 4.4+ and standard POSIX utilities (`awk`, `sed`, `grep`, `pgrep`, `find`).
+- **CLI Core:** Linux with Bash 4.4+ and standard POSIX utilities (`awk`, `sed`, `grep`, `pgrep`, `find`, `df`).
 - **Desktop GUI:** Python 3.10+ with `PySide6` (`pip install PySide6` or distribution package like `python-pyside6`).
-
----
-
-## Features
-
-- **Process Auto-Detection:** Inspects `/proc/<pid>/environ` (safely via NUL-byte parsing) to capture live `STEAM_COMPAT_*` variables, `WINEPREFIX`, and Proton binary paths in real time.
-- **Offline Environment Reconstruction:** Finds installed games, compatdata prefixes, and Proton versions across multiple Steam library folders (`libraryfolders.vdf`).
-- **Path Handling:** Translates Linux absolute/relative paths and Windows drive paths (`C:\...`, `Z:\...`).
-- **Prefix Utilities:** One-click / one-command shortcuts to launch `cmd.exe`, `winecfg`, `regedit`, or open the prefix directory.
-- **Doctor Diagnostics:** Built-in health check for Steam libraries, filesystems (with NTFS warnings), prefix permissions, and Proton installations.
-- **Robust Error Isolation:** Tolerates missing Steam roots, unmounted disks, and corrupted manifests gracefully.
 
 ---
 
@@ -69,10 +60,10 @@ proton-runner
 proton-runner gui
 ```
 
-#### Benchmark & Timing Mode
-Inspect startup timings:
+#### Benchmark & Debug Modes
 ```bash
 proton-runner gui --timing
+proton-runner gui --debug
 ```
 
 ### CLI Commands
@@ -118,7 +109,7 @@ proton-runner env 3513350
 proton-runner list
 ```
 
-#### Diagnostics
+#### Diagnostics & Health Check
 ```bash
 # Check global Steam/Proton setup
 proton-runner doctor
@@ -127,13 +118,47 @@ proton-runner doctor
 proton-runner doctor 3513350
 ```
 
+#### Targeting Specific Steam Installations (Flatpak / Custom)
+```bash
+proton-runner --steam-root ~/.var/app/com.valvesoftware.Steam/.local/share/Steam list
+```
+
+---
+
+## Project Structure
+
+```text
+proton-runner/
+├── proton-runner              # Standalone POSIX Bash CLI script
+├── proton_runner_gui.py       # Asynchronous Qt6 (PySide6) GUI application
+├── proton-runner.desktop      # Freedesktop application entry
+├── tests/                     # Automated unit and integration test suite
+│   ├── test_cli.py
+│   ├── test_parsers.py
+│   ├── test_cache.py
+│   ├── test_discovery.py
+│   ├── test_proton_providers.py
+│   ├── test_runtime.py
+│   ├── test_environment_model.py
+│   └── test_filesystem.py
+├── LICENSE                    # MIT License
+└── README.md
+```
+
 ---
 
 ## Running the Test Suite
 
-Run the automated unit and integration tests:
+Run the full automated test suite:
 ```bash
 python3 -m unittest discover -s tests -v
+```
+
+Run individual test modules:
+```bash
+python3 -m unittest tests/test_proton_providers.py -v
+python3 -m unittest tests/test_runtime.py -v
+python3 -m unittest tests/test_environment_model.py -v
 ```
 
 ---

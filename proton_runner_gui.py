@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Proton Runner v0.2.0 - Fast, Asynchronous, Progressive Qt6 Interface
-for Steam Proton Environments.
+Proton Runner v0.3.0 - Fast, Asynchronous, Progressive Qt6 Interface
+with Proton Provider Abstraction, Steam Linux Runtime Awareness,
+and Environment Inspection.
 """
 
 import os
@@ -12,29 +13,38 @@ import time
 import subprocess
 import shutil
 from pathlib import Path
+from dataclasses import dataclass, field, asdict
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QComboBox, QFileDialog,
-    QTextEdit, QFrame, QCheckBox, QDialog
+    QTextEdit, QFrame, QCheckBox, QDialog, QTableWidget,
+    QTableWidgetItem, QHeaderView, QTabWidget, QMessageBox
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtGui import QColor
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLI_PATH = SCRIPT_DIR / "proton-runner"
 if not CLI_PATH.exists():
     CLI_PATH = Path(shutil.which("proton-runner") or "proton-runner")
 
 CACHE_DIR = Path.home() / ".cache" / "proton-runner"
-CACHE_FILE = CACHE_DIR / "cache_v2.json"
+CACHE_FILE = CACHE_DIR / "cache_v3.json"
 
 TIMING_ENABLED = "--timing" in sys.argv or os.environ.get("PROTON_RUNNER_TIMING") == "1"
+DEBUG_ENABLED = "--debug" in sys.argv or os.environ.get("PROTON_RUNNER_DEBUG") == "1"
 
 IGNORED_KEYWORDS = (
     "steam linux runtime", "proton experimental", "proton hotfix",
     "proton easyanticheat", "steamworks common", "proton 10.",
     "proton 9.", "proton 8.", "proton 7.", "steamworks"
+)
+
+SENSITIVE_ENV_KEYS = (
+    "password", "token", "secret", "auth", "credential", "cookie",
+    "session", "private", "api_key"
 )
 
 
@@ -44,7 +54,89 @@ def log_timing(tag, start_time):
         print(f"[STARTUP] {tag}: {elapsed:.3f}s")
 
 
-# --- Fast Native Discovery Engine (No subprocess overhead) ---
+def log_debug(msg):
+    if DEBUG_ENABLED:
+        print(f"[DEBUG] {msg}")
+
+
+# --- Proton Provider Abstraction & Helpers ---
+
+def classify_proton_provider(name, path_str=""):
+    """Classifies a Proton tool into its provider category."""
+    name_l = (name or "").lower()
+    path_l = (path_str or "").lower()
+
+    if "ge-proton" in name_l or "ge-proton" in path_l:
+        return "GE-Proton (GloriousEggroll)"
+    elif "experimental" in name_l:
+        return "Valve Proton (Experimental)"
+    elif "hotfix" in name_l:
+        return "Valve Proton (Hotfix)"
+    elif re.search(r"proton\s*[0-9]+(\.[0-9]+)?", name_l) or "valve" in path_l:
+        return "Valve Official Proton"
+    elif "cachyos" in name_l or "tkg" in name_l or "lutris" in name_l:
+        return "Custom / Community Build"
+    else:
+        return "Community / Custom Proton"
+
+
+def detect_filesystem_type(path_obj):
+    """Detects filesystem type (e.g. btrfs, ext4, ntfs, fuseblk) for a directory."""
+    if not path_obj or not Path(path_obj).exists():
+        return "unknown"
+    try:
+        p = subprocess.run(["df", "-T", str(path_obj)], capture_output=True, text=True, timeout=2)
+        lines = p.stdout.strip().splitlines()
+        if len(lines) >= 2:
+            parts = lines[1].split()
+            if len(parts) >= 2:
+                return parts[1].lower()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def sanitize_env_vars(raw_env):
+    """Filters and sanitizes environment variables to prevent credential leakage."""
+    sanitized = {}
+    for k, v in raw_env.items():
+        k_lower = k.lower()
+        if any(s in k_lower for s in SENSITIVE_ENV_KEYS):
+            sanitized[k] = "[REDACTED]"
+        else:
+            sanitized[k] = v
+    return sanitized
+
+
+# --- Structured GameEnvironment Model ---
+
+@dataclass
+class GameEnvironment:
+    appid: str
+    game_name: str
+    steam_root: str = ""
+    steam_type: str = "Native"
+    library_path: str = ""
+    install_path: str = ""
+    compatdata_path: str = ""
+    wineprefix: str = ""
+    proton_path: str = ""
+    proton_name: str = ""
+    proton_provider: str = ""
+    runtime_type: str = "Host (Native)"
+    runtime_status: str = "Direct"
+    game_fs: str = "unknown"
+    pfx_fs: str = "unknown"
+    is_ntfs_warn: bool = False
+    is_running: bool = False
+    pid: str = ""
+    env_vars: dict = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+# --- Fast Native Discovery Engine ---
 
 def parse_vdf_paths(vdf_path):
     """Extract library paths from libraryfolders.vdf cleanly."""
@@ -97,32 +189,32 @@ def parse_acf_file(acf_path):
 
 
 def get_steam_roots():
-    """Discover valid Steam root paths."""
+    """Discover all valid Steam roots (Native + Flatpak)."""
     candidates = [
-        Path.home() / ".local/share/Steam",
-        Path.home() / ".steam/steam",
-        Path.home() / ".steam/root",
-        Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "Steam",
-        Path.home() / ".var/app/com.valvesoftware.Steam/.steam/steam",
-        Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam"
+        (Path.home() / ".local/share/Steam", "Native"),
+        (Path.home() / ".steam/steam", "Native"),
+        (Path.home() / ".steam/root", "Native"),
+        (Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "Steam", "Native"),
+        (Path.home() / ".var/app/com.valvesoftware.Steam/.steam/steam", "Flatpak"),
+        (Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam", "Flatpak")
     ]
     seen = set()
     roots = []
-    for c in candidates:
+    for c, stype in candidates:
         if c.exists():
             try:
                 resolved = c.resolve()
                 if resolved not in seen and resolved.exists():
                     seen.add(resolved)
-                    roots.append(resolved)
+                    roots.append({"path": resolved, "type": stype})
             except Exception:
                 pass
     return roots
 
 
 def find_libraries(steam_roots=None):
-    """Discover all active Steam library folders."""
-    roots = steam_roots or get_steam_roots()
+    """Discover all active Steam library folders across all roots."""
+    roots = steam_roots or [r["path"] for r in get_steam_roots()]
     libs = set(roots)
     for root in roots:
         vdf = root / "steamapps" / "libraryfolders.vdf"
@@ -165,21 +257,21 @@ def scan_games_in_libraries(libraries):
 
 
 def scan_proton_installations(libraries=None):
-    """Locate Proton tools across compatibilitytools.d and common."""
+    """Locate Proton tools and classify provider metadata."""
     search_dirs = []
-    roots = get_steam_roots()
+    roots = [r["path"] for r in get_steam_roots()]
     for r in roots:
-        search_dirs.append(r / "compatibilitytools.d")
-        search_dirs.append(r / "steamapps" / "common")
+        search_dirs.append((r / "compatibilitytools.d", "compatibilitytools.d"))
+        search_dirs.append((r / "steamapps" / "common", "steamapps/common"))
 
     libs = libraries or find_libraries(roots)
     for lib in libs:
-        search_dirs.append(lib / "compatibilitytools.d")
-        search_dirs.append(lib / "steamapps" / "common")
+        search_dirs.append((lib / "compatibilitytools.d", "compatibilitytools.d"))
+        search_dirs.append((lib / "steamapps" / "common", "steamapps/common"))
 
     protons = []
     seen_paths = set()
-    for d in search_dirs:
+    for d, source_type in search_dirs:
         if not d.exists():
             continue
         try:
@@ -188,10 +280,21 @@ def scan_proton_installations(libraries=None):
                     real_p = (p / "proton").resolve()
                     if real_p not in seen_paths:
                         seen_paths.add(real_p)
+                        provider = classify_proton_provider(p.name, str(real_p))
+                        ver = p.name
+                        ver_file = p / "version"
+                        if ver_file.is_file():
+                            try:
+                                ver = ver_file.read_text(encoding="utf-8").strip()
+                            except Exception:
+                                pass
                         protons.append({
                             "name": p.name,
+                            "version": ver,
                             "path": str(real_p),
-                            "directory": str(p)
+                            "directory": str(p),
+                            "provider": provider,
+                            "source": source_type
                         })
         except Exception:
             continue
@@ -200,7 +303,7 @@ def scan_proton_installations(libraries=None):
 
 
 def scan_running_processes():
-    """Fast /proc scanner to detect running Steam games."""
+    """Fast /proc scanner returning appid -> {pid, env}."""
     running = {}
     my_uid = os.getuid()
 
@@ -224,28 +327,34 @@ def scan_running_processes():
 
             items = data.split(b"\x00")
             detected_appid = None
+            env_map = {}
 
             for item in items:
-                if item.startswith(b"STEAM_COMPAT_APP_ID="):
-                    detected_appid = item[20:].decode(errors="ignore")
-                    break
-                elif item.startswith(b"SteamAppId="):
-                    detected_appid = item[11:].decode(errors="ignore")
-                    break
-                elif item.startswith(b"SteamGameId="):
-                    detected_appid = item[12:].decode(errors="ignore")
-                    break
-                elif item.startswith(b"WINEPREFIX=") and b"/compatdata/" in item:
-                    val = item[11:].decode(errors="ignore")
-                    parts = val.split("/compatdata/")
-                    if len(parts) > 1:
-                        cand = parts[1].split("/")[0]
-                        if cand.isdigit():
-                            detected_appid = cand
-                            break
+                if b"=" in item:
+                    k, v = item.split(b"=", 1)
+                    k_str = k.decode(errors="ignore")
+                    v_str = v.decode(errors="ignore")
+                    env_map[k_str] = v_str
+
+                    if k_str == "STEAM_COMPAT_APP_ID":
+                        detected_appid = v_str
+                    elif k_str == "SteamAppId" and not detected_appid:
+                        detected_appid = v_str
+                    elif k_str == "SteamGameId" and not detected_appid:
+                        detected_appid = v_str
+
+            if not detected_appid and "WINEPREFIX" in env_map:
+                wp = env_map["WINEPREFIX"]
+                if "/compatdata/" in wp:
+                    cand = wp.split("/compatdata/")[1].split("/")[0]
+                    if cand.isdigit():
+                        detected_appid = cand
 
             if detected_appid and detected_appid != "0":
-                running[detected_appid] = p.name
+                running[detected_appid] = {
+                    "pid": p.name,
+                    "env": env_map
+                }
 
         except Exception:
             continue
@@ -253,7 +362,7 @@ def scan_running_processes():
     return running
 
 
-# --- Smart XDG Cache with Mtime Invalidation ---
+# --- Smart XDG Cache (v3 Schema) ---
 
 class SmartCache:
     @staticmethod
@@ -282,10 +391,10 @@ class SmartCache:
             with open(CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            if data.get("schema_version") != 2:
+            if data.get("schema_version") != 3:
                 return None
 
-            # Expire if older than 24 hours
+            # Expire after 24 hours
             if time.time() - data.get("timestamp", 0) > 86400:
                 return None
 
@@ -299,22 +408,27 @@ class SmartCache:
                 else:
                     return None
 
-            return data.get("games", [])
+            return {
+                "games": data.get("games", []),
+                "protons": data.get("protons", []),
+                "roots": data.get("roots", [])
+            }
         except Exception:
             return None
 
     @staticmethod
-    def save(games, libraries, protons=None):
+    def save(games, libraries, protons=None, roots=None):
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             mtimes = SmartCache.get_library_mtimes(libraries)
             payload = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "timestamp": time.time(),
                 "mtimes": mtimes,
                 "libraries": [str(l) for l in libraries],
                 "games": games,
-                "protons": protons or []
+                "protons": protons or [],
+                "roots": roots or []
             }
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(payload, f)
@@ -322,48 +436,25 @@ class SmartCache:
             pass
 
 
-# --- Progressive Discovery Pipeline (QThread) ---
+# --- Background Worker Threads ---
 
 class ProgressiveDiscoveryWorker(QThread):
-    stage_started = Signal(str)
-    stage_progress = Signal(str, int, int)
-    stage_finished = Signal(str, object)
-    stage_error = Signal(str, str)
-    discovery_complete = Signal(list, list, dict)
+    discovery_complete = Signal(list, list, list, dict)
 
     def run(self):
         t0 = time.perf_counter()
-
-        # Stage 1: Steam Roots
-        self.stage_started.emit("Steam Roots")
-        roots = get_steam_roots()
-        self.stage_finished.emit("Steam Roots", roots)
-
-        # Stage 2: Libraries
-        self.stage_started.emit("Libraries")
-        libs = find_libraries(roots)
-        self.stage_finished.emit("Libraries", libs)
-
-        # Stage 3: Installed Games
-        self.stage_started.emit("Games")
+        roots_info = get_steam_roots()
+        roots_paths = [r["path"] for r in roots_info]
+        libs = find_libraries(roots_paths)
         games = scan_games_in_libraries(libs)
-        self.stage_finished.emit("Games", games)
-
-        # Stage 4: Proton Tools
-        self.stage_started.emit("Proton Versions")
         protons = scan_proton_installations(libs)
-        self.stage_finished.emit("Proton Versions", protons)
-
-        # Stage 5: Running Processes
-        self.stage_started.emit("Process Scan")
         running = scan_running_processes()
-        self.stage_finished.emit("Process Scan", running)
 
-        # Cache update
-        SmartCache.save(games, libs, protons)
+        roots_serialized = [{"path": str(r["path"]), "type": r["type"]} for r in roots_info]
+        SmartCache.save(games, libs, protons, roots_serialized)
 
         log_timing("Progressive discovery pipeline", t0)
-        self.discovery_complete.emit(games, protons, running)
+        self.discovery_complete.emit(games, protons, roots_info, running)
 
 
 class ProcessScanWorker(QThread):
@@ -375,25 +466,72 @@ class ProcessScanWorker(QThread):
 
 
 class DetailFetchWorker(QThread):
-    detail_ready = Signal(str, dict)
+    detail_ready = Signal(str, object)
 
-    def __init__(self, appid, parent=None):
+    def __init__(self, appid, live_proc_info=None, parent=None):
         super().__init__(parent)
-        self.appid = appid
+        self.appid = str(appid)
+        self.live_proc_info = live_proc_info or {}
 
     def run(self):
-        info_data = {"proton": "-", "prefix": "-", "status": "Offline"}
-        try:
-            p = subprocess.run([str(CLI_PATH), "info", str(self.appid)], capture_output=True, text=True, timeout=5)
-            for line in p.stdout.splitlines():
-                if "Wine prefix:" in line:
-                    info_data["prefix"] = line.split(":", 1)[1].strip()
-                elif "Proton:" in line:
-                    info_data["proton"] = Path(line.split(":", 1)[1].strip()).parent.name
-        except Exception as e:
-            info_data["error"] = str(e)
+        env_obj = GameEnvironment(
+            appid=self.appid,
+            game_name=f"AppID {self.appid}",
+            is_running=bool(self.live_proc_info),
+            pid=str(self.live_proc_info.get("pid", ""))
+        )
 
-        self.detail_ready.emit(self.appid, info_data)
+        try:
+            p = subprocess.run([str(CLI_PATH), "info", self.appid], capture_output=True, text=True, timeout=5)
+            for line in p.stdout.splitlines():
+                if "Game name:" in line:
+                    env_obj.game_name = line.split(":", 1)[1].strip()
+                elif "Steam root:" in line:
+                    env_obj.steam_root = line.split(":", 1)[1].strip()
+                elif "Game directory:" in line:
+                    env_obj.install_path = line.split(":", 1)[1].strip()
+                elif "Compatdata:" in line:
+                    env_obj.compatdata_path = line.split(":", 1)[1].strip()
+                elif "Wine prefix:" in line:
+                    env_obj.wineprefix = line.split(":", 1)[1].strip()
+                elif "Proton:" in line:
+                    env_obj.proton_path = line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+
+        # Proton metadata
+        if env_obj.proton_path and env_obj.proton_path != "Not detected":
+            p_dir = Path(env_obj.proton_path).parent
+            env_obj.proton_name = p_dir.name
+            env_obj.proton_provider = classify_proton_provider(p_dir.name, env_obj.proton_path)
+
+        # Filesystem checks
+        if env_obj.install_path:
+            env_obj.game_fs = detect_filesystem_type(env_obj.install_path)
+        if env_obj.wineprefix:
+            env_obj.pfx_fs = detect_filesystem_type(env_obj.wineprefix)
+
+        env_obj.is_ntfs_warn = env_obj.game_fs in ("ntfs", "fuseblk", "vfat", "exfat") or \
+                               env_obj.pfx_fs in ("ntfs", "fuseblk", "vfat", "exfat")
+
+        # Steam Linux Runtime / Pressure-Vessel detection
+        live_env = self.live_proc_info.get("env", {})
+        if live_env:
+            if "PRESSURE_VESSEL_CONTAINER_DIR" in live_env or "STEAM_LINUX_RUNTIME_CONTAINER" in live_env:
+                env_obj.runtime_type = "Steam Linux Runtime (Pressure-Vessel Container)"
+                env_obj.runtime_status = "Container-Attached"
+            elif "STEAM_RUNTIME" in live_env:
+                env_obj.runtime_type = "Steam Linux Runtime (Legacy Scout)"
+                env_obj.runtime_status = "Partially Reproducible"
+            else:
+                env_obj.runtime_type = "Host Native"
+                env_obj.runtime_status = "Direct"
+            env_obj.env_vars = sanitize_env_vars(live_env)
+        else:
+            env_obj.runtime_type = "Host / Offline Environment"
+            env_obj.runtime_status = "Reconstructed"
+
+        self.detail_ready.emit(self.appid, env_obj)
 
 
 class CommandWorker(QThread):
@@ -435,11 +573,132 @@ class CommandWorker(QThread):
         self.wait(500)
 
 
+# --- Dialogs: Environment Inspector & Doctor ---
+
+class EnvironmentDialog(QDialog):
+    def __init__(self, env: GameEnvironment, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Environment Inspector - {env.game_name} ({env.appid})")
+        self.resize(720, 560)
+        self.env = env
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        # Overview Card
+        card = QFrame()
+        card.setObjectName("panel")
+        card_l = QVBoxLayout(card)
+        card_l.setSpacing(6)
+
+        header_lbl = QLabel(f"<b>{env.game_name}</b> (AppID {env.appid})")
+        header_lbl.setStyleSheet("font-size: 14px; color: #60a5fa;")
+        card_l.addWidget(header_lbl)
+
+        status_text = f"<span style='color: #22c55e;'>● Running (PID {env.pid})</span>" if env.is_running else "<span style='color: #9ca3af;'>○ Offline</span>"
+        card_l.addWidget(QLabel(f"<b>Process Status:</b> {status_text}"))
+        card_l.addWidget(QLabel(f"<b>Steam Root:</b> {env.steam_root} ({env.steam_type})"))
+        card_l.addWidget(QLabel(f"<b>Proton Provider:</b> {env.proton_provider} ({env.proton_name or 'Default'})"))
+        card_l.addWidget(QLabel(f"<b>Runtime Container:</b> {env.runtime_type} [{env.runtime_status}]"))
+
+        fs_warn_html = ""
+        if env.is_ntfs_warn:
+            fs_warn_html = " <span style='color: #f59e0b; font-weight: bold;'>⚠ NTFS Detected (symlink limitations)</span>"
+        card_l.addWidget(QLabel(f"<b>Filesystems:</b> Game: <code>{env.game_fs}</code> | Prefix: <code>{env.pfx_fs}</code>{fs_warn_html}"))
+
+        layout.addWidget(card)
+
+        # Tabs: Paths & Environment Variables
+        tabs = QTabWidget()
+
+        # Tab 1: Key Paths
+        tab_paths = QWidget()
+        tp_l = QVBoxLayout(tab_paths)
+        tp_l.setSpacing(8)
+
+        for label_text, val_text in [
+            ("Game Install Directory", env.install_path),
+            ("Compatdata Directory", env.compatdata_path),
+            ("Wine Prefix (pfx)", env.wineprefix),
+            ("Proton Executable", env.proton_path)
+        ]:
+            row = QHBoxLayout()
+            lbl = QLabel(f"<b>{label_text}:</b>")
+            lbl.setFixedWidth(160)
+            val_edit = QLineEdit(val_text)
+            val_edit.setReadOnly(True)
+            btn_copy = QPushButton("Copy")
+            btn_copy.setFixedWidth(60)
+            btn_copy.clicked.connect(lambda _, v=val_text: QApplication.clipboard().setText(v))
+            row.addWidget(lbl)
+            row.addWidget(val_edit, 1)
+            row.addWidget(btn_copy)
+            tp_l.addLayout(row)
+
+        tp_l.addStretch()
+        tabs.addTab(tab_paths, "Key Paths")
+
+        # Tab 2: Environment Variables
+        tab_env = QWidget()
+        te_l = QVBoxLayout(tab_env)
+
+        filter_box = QHBoxLayout()
+        filter_input = QLineEdit()
+        filter_input.setPlaceholderText("Filter environment variables...")
+        filter_box.addWidget(filter_input)
+        te_l.addLayout(filter_box)
+
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Variable", "Value"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.verticalHeader().setVisible(False)
+
+        rows = sorted(env.env_vars.items())
+        table.setRowCount(len(rows))
+        for i, (k, v) in enumerate(rows):
+            k_item = QTableWidgetItem(k)
+            v_item = QTableWidgetItem(v)
+            table.setItem(i, 0, k_item)
+            table.setItem(i, 1, v_item)
+
+        def filter_table(text):
+            query = text.lower()
+            for r in range(table.rowCount()):
+                match = query in table.item(r, 0).text().lower() or query in table.item(r, 1).text().lower()
+                table.setRowHidden(r, not match)
+
+        filter_input.textChanged.connect(filter_table)
+        te_l.addWidget(table)
+
+        btn_copy_all = QPushButton("Copy All Variables (Shell Export Format)")
+        btn_copy_all.clicked.connect(self.copy_all_env)
+        te_l.addWidget(btn_copy_all)
+
+        tabs.addTab(tab_env, f"Environment Variables ({len(rows)})")
+        layout.addWidget(tabs, 1)
+
+        # Bottom Bar
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        bottom.addWidget(btn_close)
+        layout.addLayout(bottom)
+
+    def copy_all_env(self):
+        export_lines = [f'export {k}="{v}"' for k, v in sorted(self.env.env_vars.items())]
+        QApplication.clipboard().setText("\n".join(export_lines))
+        QMessageBox.information(self, "Copied", "Environment variables copied to clipboard in export format.")
+
+
 class DoctorDialog(QDialog):
     def __init__(self, appid=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Diagnostics {f'- AppID {appid}' if appid else ''}")
-        self.resize(600, 420)
+        self.resize(640, 460)
         self.appid = appid
         self.worker = None
 
@@ -502,18 +761,22 @@ class DoctorDialog(QDialog):
         super().accept()
 
 
+# --- Main Window ---
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         t_init = time.perf_counter()
-        self.setWindowTitle("Proton Runner")
-        self.resize(640, 520)
-        self.setMinimumSize(560, 440)
+        self.setWindowTitle(f"Proton Runner v{VERSION}")
+        self.resize(660, 540)
+        self.setMinimumSize(580, 460)
 
         self.games = []
         self.protons = []
+        self.roots = []
         self.running_map = {}
         self.selected_appid = None
+        self.current_env = None
         self.auto_detect = True
         self.details_cache = {}
 
@@ -527,13 +790,14 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         log_timing("MainWindow UI setup", t_init)
 
-        # Load instant disk cache if available
-        cached_games = SmartCache.load()
-        if cached_games:
-            self.games = cached_games
+        # Load instant cache
+        cached = SmartCache.load()
+        if cached:
+            self.games = cached.get("games", [])
+            self.protons = cached.get("protons", [])
             self.update_combo()
 
-        # Background process polling timer (non-blocking)
+        # Non-blocking process polling
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self.trigger_process_scan)
         self.poll_timer.start(2000)
@@ -603,7 +867,7 @@ class MainWindow(QMainWindow):
                 background: #1e3a6e;
                 color: #94a3b8;
             }
-            QTextEdit {
+            QTextEdit, QTableWidget {
                 background: #141416;
                 color: #9ca3af;
                 border: 1px solid #2d3039;
@@ -611,6 +875,21 @@ class MainWindow(QMainWindow):
                 font-family: monospace;
                 font-size: 11px;
                 padding: 6px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #2d3039;
+                background: #18191d;
+            }
+            QTabBar::tab {
+                background: #202228;
+                color: #9ca3af;
+                padding: 6px 12px;
+                border: 1px solid #2d3039;
+                border-bottom: none;
+            }
+            QTabBar::tab:selected {
+                background: #2a2d36;
+                color: #f3f4f6;
             }
             QCheckBox {
                 color: #9ca3af;
@@ -624,7 +903,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        # 1. Top Bar: Target Game Selector & Auto-detect
+        # 1. Top Bar: Game Selector & Auto-detect
         top = QHBoxLayout()
         top.setSpacing(8)
 
@@ -652,7 +931,7 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(top)
 
-        # 2. Environment Info Card
+        # 2. Environment Summary Card
         self.info_panel = QFrame()
         self.info_panel.setObjectName("panel")
         info_l = QVBoxLayout(self.info_panel)
@@ -710,7 +989,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(run_panel)
 
-        # 4. Quick Actions
+        # 4. Quick Actions + Inspect Env
         tools = QHBoxLayout()
         tools.setSpacing(6)
 
@@ -726,13 +1005,17 @@ class MainWindow(QMainWindow):
         btn_reg.clicked.connect(lambda: self.run_wine("regedit"))
         tools.addWidget(btn_reg)
 
-        btn_pfx = QPushButton("Open Prefix Folder")
+        btn_pfx = QPushButton("Open Prefix")
         btn_pfx.clicked.connect(self.open_pfx)
         tools.addWidget(btn_pfx)
 
+        btn_inspect = QPushButton("Inspect Env")
+        btn_inspect.clicked.connect(self.open_env_inspector)
+        tools.addWidget(btn_inspect)
+
         layout.addLayout(tools)
 
-        # 5. Log Output
+        # 5. Output Log
         log_header = QHBoxLayout()
         log_header.addWidget(QLabel("Output Log:"))
         log_header.addStretch()
@@ -750,14 +1033,13 @@ class MainWindow(QMainWindow):
         self.log_view.append(text.rstrip())
 
     def start_background_discovery(self):
-        """Asynchronously trigger the progressive discovery pipeline."""
+        """Trigger asynchronous discovery pipeline."""
         if self.discovery_worker and self.discovery_worker.isRunning():
             return
         self.discovery_worker = ProgressiveDiscoveryWorker(parent=self)
         self.discovery_worker.discovery_complete.connect(self.on_discovery_complete)
         self.discovery_worker.start()
 
-        # Trigger process scan simultaneously
         self.trigger_process_scan()
 
     def trigger_process_scan(self):
@@ -768,20 +1050,21 @@ class MainWindow(QMainWindow):
         self.process_worker.running_ready.connect(self.on_running_processes_ready)
         self.process_worker.start()
 
-    def on_discovery_complete(self, games, protons, running):
+    def on_discovery_complete(self, games, protons, roots, running):
         self.games = games
         self.protons = protons
+        self.roots = roots
         self.running_map = running
         self.update_combo()
 
     def on_running_processes_ready(self, running_map):
-        changed = (self.running_map != running_map)
+        changed = (set(self.running_map.keys()) != set(running_map.keys()))
         self.running_map = running_map
 
         if changed:
             self.update_combo()
 
-        # Check if auto-detection should switch
+        # Auto-switch if enabled
         if self.auto_detect and running_map:
             first_running = next(iter(running_map))
             if self.selected_appid != first_running:
@@ -793,7 +1076,6 @@ class MainWindow(QMainWindow):
     def update_combo(self):
         current_data = self.selected_appid or self.game_combo.currentData()
 
-        # Sort: running first, then recency
         sorted_games = sorted(
             self.games,
             key=lambda g: (g["appid"] not in self.running_map, -g.get("last_played", 0), g["name"].lower())
@@ -832,19 +1114,22 @@ class MainWindow(QMainWindow):
 
     def update_info_lazy(self, appid):
         """Updates game info on-demand without freezing the UI."""
-        self.selected_appid = appid
-        is_running = appid in self.running_map
-        pid = self.running_map.get(appid, "")
+        self.selected_appid = str(appid)
+        proc_info = self.running_map.get(str(appid), {})
+        is_running = bool(proc_info)
+        pid = proc_info.get("pid", "")
 
         if is_running:
             self.status_line.setText(f"<span style='color: #22c55e; font-weight: bold;'>● Running (PID {pid})</span> - Proton active")
         else:
             self.status_line.setText("<span style='color: #9ca3af;'>○ Offline</span> - Environment reconstructed on run")
 
-        # If already cached in memory, show instantly
+        # Check in-memory cache
         if appid in self.details_cache:
-            data = self.details_cache[appid]
-            self.env_line.setText(f"<b>Proton:</b> {data.get('proton', '-')}  |  <b>Prefix:</b> {data.get('prefix', '-')}")
+            env = self.details_cache[appid]
+            self.current_env = env
+            p_display = f"{env.proton_provider} ({env.proton_name})" if env.proton_provider else (env.proton_name or "-")
+            self.env_line.setText(f"<b>Proton:</b> {p_display}  |  <b>Prefix:</b> {env.wineprefix or '-'}")
             return
 
         self.env_line.setText("<b>Proton:</b> loading...  |  <b>Prefix:</b> loading...")
@@ -852,14 +1137,31 @@ class MainWindow(QMainWindow):
         if self.detail_worker and self.detail_worker.isRunning():
             self.detail_worker.terminate()
 
-        self.detail_worker = DetailFetchWorker(appid, parent=self)
+        self.detail_worker = DetailFetchWorker(appid, live_proc_info=proc_info, parent=self)
         self.detail_worker.detail_ready.connect(self.on_detail_ready)
         self.detail_worker.start()
 
-    def on_detail_ready(self, appid, data):
-        self.details_cache[appid] = data
+    def on_detail_ready(self, appid, env: GameEnvironment):
+        self.details_cache[appid] = env
         if self.selected_appid == appid:
-            self.env_line.setText(f"<b>Proton:</b> {data.get('proton', '-')}  |  <b>Prefix:</b> {data.get('prefix', '-')}")
+            self.current_env = env
+            p_display = f"{env.proton_provider} ({env.proton_name})" if env.proton_provider else (env.proton_name or "-")
+            self.env_line.setText(f"<b>Proton:</b> {p_display}  |  <b>Prefix:</b> {env.wineprefix or '-'}")
+
+    def open_env_inspector(self):
+        if not self.selected_appid:
+            return
+        env = self.current_env
+        if not env:
+            proc_info = self.running_map.get(str(self.selected_appid), {})
+            env = GameEnvironment(
+                appid=str(self.selected_appid),
+                game_name=f"AppID {self.selected_appid}",
+                is_running=bool(proc_info),
+                pid=str(proc_info.get("pid", ""))
+            )
+        dlg = EnvironmentDialog(env, self)
+        dlg.exec()
 
     def browse_exe(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -924,10 +1226,8 @@ class MainWindow(QMainWindow):
     def open_pfx(self):
         if not self.selected_appid:
             return
-        cached = self.details_cache.get(self.selected_appid, {})
-        pfx_str = cached.get("prefix", "-")
-        if pfx_str and pfx_str != "-":
-            pfx = Path(pfx_str)
+        if self.current_env and self.current_env.wineprefix:
+            pfx = Path(self.current_env.wineprefix)
             target = pfx / "drive_c" if (pfx / "drive_c").exists() else pfx
             if target.exists():
                 subprocess.Popen(["xdg-open", str(target)])
@@ -968,7 +1268,7 @@ def main():
     log_timing("MainWindow constructed & shown on screen", t_win)
     log_timing("Total time to interactive window", t0)
 
-    # Start progressive background discovery
+    # Progressive background discovery
     win.start_background_discovery()
 
     sys.exit(app.exec())
