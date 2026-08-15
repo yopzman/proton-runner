@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-Proton Runner - Compact, minimalist Qt6 interface for Steam Proton environments.
+Proton Runner - Fast, Asynchronous, Minimalist Qt6 Interface
+for Steam Proton Environments.
 """
 
+import os
 import sys
+import json
+import time
 import subprocess
 import shutil
 from pathlib import Path
@@ -20,11 +24,243 @@ CLI_PATH = SCRIPT_DIR / "proton-runner"
 if not CLI_PATH.exists():
     CLI_PATH = Path(shutil.which("proton-runner") or "proton-runner")
 
-IGNORED_KEYWORDS = [
+CACHE_DIR = Path.home() / ".cache" / "proton-runner"
+CACHE_FILE = CACHE_DIR / "games_cache.json"
+
+TIMING_ENABLED = "--timing" in sys.argv or os.environ.get("PROTON_RUNNER_TIMING") == "1"
+
+IGNORED_KEYWORDS = (
     "steam linux runtime", "proton experimental", "proton hotfix",
     "proton easyanticheat", "steamworks common", "proton 10.",
     "proton 9.", "proton 8.", "proton 7.", "steamworks"
-]
+)
+
+
+def log_timing(tag, start_time):
+    if TIMING_ENABLED:
+        elapsed = time.perf_counter() - start_time
+        print(f"[STARTUP] {tag}: {elapsed:.3f}s")
+
+
+# --- Fast Native Python Discovery Helpers (Zero Subprocesses) ---
+
+def get_steam_roots():
+    candidates = [
+        Path.home() / ".local/share/Steam",
+        Path.home() / ".steam/steam",
+        Path.home() / ".steam/root",
+        Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "Steam",
+        Path.home() / ".var/app/com.valvesoftware.Steam/.steam/steam",
+        Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam"
+    ]
+    seen = set()
+    roots = []
+    for c in candidates:
+        if c.exists():
+            try:
+                resolved = c.resolve()
+                if resolved not in seen and resolved.exists():
+                    seen.add(resolved)
+                    roots.append(resolved)
+            except Exception:
+                pass
+    return roots
+
+
+def find_all_libraries():
+    roots = get_steam_roots()
+    libs = set(roots)
+    for root in roots:
+        vdf = root / "steamapps" / "libraryfolders.vdf"
+        if vdf.exists():
+            try:
+                with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if '"path"' in line:
+                            parts = line.split('"')
+                            if len(parts) >= 4:
+                                p = Path(parts[3])
+                                if p.exists():
+                                    libs.add(p.resolve())
+            except Exception:
+                pass
+    return list(libs)
+
+
+def scan_installed_games_fast(libraries):
+    """Fast native Python parser for appmanifest_*.acf without shelling out."""
+    games = []
+    seen_appids = set()
+
+    for lib in libraries:
+        steamapps = lib / "steamapps"
+        if not steamapps.exists():
+            continue
+
+        try:
+            acf_files = list(steamapps.glob("appmanifest_*.acf"))
+        except Exception:
+            continue
+
+        for acf in acf_files:
+            appid = acf.stem.replace("appmanifest_", "")
+            if appid in seen_appids or not appid.isdigit():
+                continue
+
+            name = f"AppID {appid}"
+            last_played = 0
+            try:
+                with open(acf, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if '"name"' in line:
+                            parts = line.split('"')
+                            if len(parts) >= 4:
+                                name = parts[3]
+                        elif '"LastPlayed"' in line:
+                            parts = line.split('"')
+                            if len(parts) >= 4 and parts[3].isdigit():
+                                last_played = int(parts[3])
+            except Exception:
+                pass
+
+            name_lower = name.lower()
+            if any(k in name_lower for k in IGNORED_KEYWORDS):
+                continue
+
+            seen_appids.add(appid)
+            games.append({
+                "appid": appid,
+                "name": name,
+                "last_played": last_played,
+                "library": str(lib)
+            })
+
+    games.sort(key=lambda g: (-g["last_played"], g["name"].lower()))
+    return games
+
+
+def scan_running_games_fast():
+    """Fast native /proc parser to detect running Steam games without Bash overhead."""
+    running = {}
+    my_uid = os.getuid()
+
+    try:
+        proc_entries = [p for p in Path("/proc").iterdir() if p.name.isdigit()]
+    except Exception:
+        return running
+
+    for p in proc_entries:
+        try:
+            # Check owner
+            stat = p.stat()
+            if stat.st_uid != my_uid:
+                continue
+
+            environ_file = p / "environ"
+            if not environ_file.exists():
+                continue
+
+            with open(environ_file, "rb") as f:
+                data = f.read()
+
+            items = data.split(b"\x00")
+            detected_appid = None
+
+            for item in items:
+                if item.startswith(b"STEAM_COMPAT_APP_ID="):
+                    detected_appid = item[20:].decode(errors="ignore")
+                    break
+                elif item.startswith(b"SteamAppId="):
+                    detected_appid = item[11:].decode(errors="ignore")
+                    break
+                elif item.startswith(b"SteamGameId="):
+                    detected_appid = item[12:].decode(errors="ignore")
+                    break
+                elif item.startswith(b"WINEPREFIX=") and b"/compatdata/" in item:
+                    val = item[11:].decode(errors="ignore")
+                    parts = val.split("/compatdata/")
+                    if len(parts) > 1:
+                        cand = parts[1].split("/")[0]
+                        if cand.isdigit():
+                            detected_appid = cand
+                            break
+
+            if detected_appid and detected_appid != "0":
+                running[detected_appid] = p.name
+
+        except Exception:
+            continue
+
+    return running
+
+
+# --- Cache Management ---
+
+def load_cache():
+    if not CACHE_FILE.exists():
+        return None
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # Valid if younger than 24 hours
+            if time.time() - data.get("timestamp", 0) < 86400:
+                return data.get("games", [])
+    except Exception:
+        pass
+    return None
+
+
+def save_cache(games):
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"timestamp": time.time(), "games": games}, f)
+    except Exception:
+        pass
+
+
+# --- Asynchronous Worker Threads ---
+
+class FastDiscoveryWorker(QThread):
+    games_ready = Signal(list)
+
+    def run(self):
+        t0 = time.perf_counter()
+        libs = find_all_libraries()
+        games = scan_installed_games_fast(libs)
+        save_cache(games)
+        log_timing("Background library & game discovery", t0)
+        self.games_ready.emit(games)
+
+
+class ProcessScanWorker(QThread):
+    running_ready = Signal(dict)
+
+    def run(self):
+        running = scan_running_games_fast()
+        self.running_ready.emit(running)
+
+
+class DetailFetchWorker(QThread):
+    detail_ready = Signal(str, dict)
+
+    def __init__(self, appid, parent=None):
+        super().__init__(parent)
+        self.appid = appid
+
+    def run(self):
+        info_data = {"proton": "-", "prefix": "-", "status": "Offline"}
+        try:
+            p = subprocess.run([str(CLI_PATH), "info", str(self.appid)], capture_output=True, text=True, timeout=5)
+            for line in p.stdout.splitlines():
+                if "Wine prefix:" in line:
+                    info_data["prefix"] = line.split(":", 1)[1].strip()
+                elif "Proton:" in line:
+                    info_data["proton"] = Path(line.split(":", 1)[1].strip()).parent.name
+        except Exception as e:
+            info_data["error"] = str(e)
+
+        self.detail_ready.emit(self.appid, info_data)
 
 
 class CommandWorker(QThread):
@@ -136,22 +372,37 @@ class DoctorDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        t_init = time.perf_counter()
         self.setWindowTitle("Proton Runner")
         self.resize(640, 520)
         self.setMinimumSize(560, 440)
 
         self.games = []
+        self.running_map = {}
         self.selected_appid = None
         self.auto_detect = True
-        self.worker = None
+        self.details_cache = {}
+
+        # Workers
+        self.discovery_worker = None
+        self.process_worker = None
+        self.detail_worker = None
+        self.cmd_worker = None
 
         self.apply_theme()
         self.setup_ui()
-        self.refresh_games()
+        log_timing("MainWindow UI setup", t_init)
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.poll_running)
-        self.timer.start(1500)
+        # Load instant disk cache if present
+        cached_games = load_cache()
+        if cached_games:
+            self.games = cached_games
+            self.update_combo()
+
+        # Background process polling timer (non-blocking)
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(self.trigger_process_scan)
+        self.poll_timer.start(2000)
 
     def apply_theme(self):
         self.setStyleSheet("""
@@ -239,7 +490,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        # 1. Top Bar: Target Game Selector & Auto-detect
+        # 1. Top Bar: Game Selector & Controls
         top = QHBoxLayout()
         top.setSpacing(8)
 
@@ -248,6 +499,7 @@ class MainWindow(QMainWindow):
         top.addWidget(lbl)
 
         self.game_combo = QComboBox()
+        self.game_combo.addItem("Detecting Steam games...", None)
         self.game_combo.currentIndexChanged.connect(self.on_combo_changed)
         top.addWidget(self.game_combo, 1)
 
@@ -257,7 +509,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.auto_cb)
 
         btn_refresh = QPushButton("Refresh")
-        btn_refresh.clicked.connect(self.refresh_games)
+        btn_refresh.clicked.connect(self.start_background_discovery)
         top.addWidget(btn_refresh)
 
         btn_diag = QPushButton("Doctor")
@@ -273,7 +525,7 @@ class MainWindow(QMainWindow):
         info_l.setContentsMargins(10, 8, 10, 8)
         info_l.setSpacing(4)
 
-        self.status_line = QLabel("Status: Idle")
+        self.status_line = QLabel("Status: Detecting...")
         self.status_line.setStyleSheet("color: #9ca3af; font-size: 11px;")
         info_l.addWidget(self.status_line)
 
@@ -363,143 +615,116 @@ class MainWindow(QMainWindow):
     def log(self, text):
         self.log_view.append(text.rstrip())
 
-    def refresh_games(self):
-        self.games = []
-        running_map = {}
+    def start_background_discovery(self):
+        """Asynchronously scan Steam libraries without blocking the Qt event loop."""
+        if self.discovery_worker and self.discovery_worker.isRunning():
+            return
+        self.discovery_worker = FastDiscoveryWorker(parent=self)
+        self.discovery_worker.games_ready.connect(self.on_games_discovered)
+        self.discovery_worker.start()
 
-        try:
-            p = subprocess.run([str(CLI_PATH), "list"], capture_output=True, text=True)
-            for line in p.stdout.splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 2 and parts[0].isdigit():
-                    running_map[parts[0]] = parts[1]
-        except Exception:
-            pass
+        # Trigger process scan simultaneously
+        self.trigger_process_scan()
 
-        steam_roots = [
-            Path.home() / ".local/share/Steam",
-            Path.home() / ".steam/steam",
-            Path.home() / ".steam/root"
-        ]
+    def trigger_process_scan(self):
+        """Asynchronously scan /proc for running Steam games without blocking."""
+        if self.process_worker and self.process_worker.isRunning():
+            return
+        self.process_worker = ProcessScanWorker(parent=self)
+        self.process_worker.running_ready.connect(self.on_running_processes_ready)
+        self.process_worker.start()
 
-        libs = set()
-        for root in steam_roots:
-            if root.exists():
-                libs.add(root)
-                vdf = root / "steamapps/libraryfolders.vdf"
-                if vdf.exists():
-                    try:
-                        with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
-                            for line in f:
-                                if '"path"' in line:
-                                    parts = line.split('"')
-                                    if len(parts) >= 4 and Path(parts[3]).exists():
-                                        libs.add(Path(parts[3]))
-                    except Exception:
-                        pass
+    def on_games_discovered(self, games):
+        self.games = games
+        self.update_combo()
 
-        seen = set()
-        for lib in libs:
-            steamapps = lib / "steamapps"
-            if steamapps.exists():
-                for acf in steamapps.glob("appmanifest_*.acf"):
-                    appid = acf.stem.replace("appmanifest_", "")
-                    if appid in seen or not appid.isdigit():
-                        continue
+    def on_running_processes_ready(self, running_map):
+        changed = (self.running_map != running_map)
+        self.running_map = running_map
 
-                    name = f"AppID {appid}"
-                    last_played = 0
-                    try:
-                        with open(acf, "r", encoding="utf-8", errors="ignore") as f:
-                            for line in f:
-                                if '"name"' in line:
-                                    parts = line.split('"')
-                                    if len(parts) >= 4:
-                                        name = parts[3]
-                                elif '"LastPlayed"' in line:
-                                    parts = line.split('"')
-                                    if len(parts) >= 4 and parts[3].isdigit():
-                                        last_played = int(parts[3])
-                    except Exception:
-                        pass
+        if changed:
+            self.update_combo()
 
-                    name_lower = name.lower()
-                    if any(k in name_lower for k in IGNORED_KEYWORDS):
-                        continue
+        # Check if auto-detection should switch
+        if self.auto_detect and running_map:
+            first_running = next(iter(running_map))
+            if self.selected_appid != first_running:
+                for i in range(self.game_combo.count()):
+                    if self.game_combo.itemData(i) == first_running:
+                        self.game_combo.setCurrentIndex(i)
+                        break
 
-                    seen.add(appid)
-                    self.games.append({
-                        "appid": appid,
-                        "name": name,
-                        "running": appid in running_map,
-                        "pid": running_map.get(appid, ""),
-                        "last_played": last_played
-                    })
+    def update_combo(self):
+        current_data = self.selected_appid or self.game_combo.currentData()
 
-        self.games.sort(key=lambda g: (not g["running"], -g["last_played"], g["name"].lower()))
+        # Sort: running first, then recency
+        sorted_games = sorted(
+            self.games,
+            key=lambda g: (g["appid"] not in self.running_map, -g.get("last_played", 0), g["name"].lower())
+        )
 
         self.game_combo.blockSignals(True)
         self.game_combo.clear()
-        for g in self.games:
-            prefix = "● " if g["running"] else "○ "
-            label = f"{prefix}{g['name']} ({g['appid']})"
-            self.game_combo.addItem(label, g["appid"])
+
+        if not sorted_games:
+            self.game_combo.addItem("No installed games found", None)
+        else:
+            select_idx = 0
+            for i, g in enumerate(sorted_games):
+                is_running = g["appid"] in self.running_map
+                dot = "● " if is_running else "○ "
+                label = f"{dot}{g['name']} ({g['appid']})"
+                self.game_combo.addItem(label, g["appid"])
+                if g["appid"] == current_data:
+                    select_idx = i
+
+            self.game_combo.setCurrentIndex(select_idx)
+
         self.game_combo.blockSignals(False)
 
-        if self.game_combo.count() > 0:
-            self.game_combo.setCurrentIndex(0)
-            self.update_info(self.game_combo.currentData())
-
-    def poll_running(self):
-        if not self.auto_detect:
-            return
-
-        try:
-            p = subprocess.run([str(CLI_PATH), "list"], capture_output=True, text=True, timeout=2)
-            for line in p.stdout.splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 2 and parts[0].isdigit():
-                    running_appid = parts[0]
-                    if self.selected_appid != running_appid:
-                        for i in range(self.game_combo.count()):
-                            if self.game_combo.itemData(i) == running_appid:
-                                self.game_combo.setCurrentIndex(i)
-                                return
-        except Exception:
-            pass
+        selected = self.game_combo.currentData()
+        if selected:
+            self.selected_appid = selected
+            self.update_info_lazy(selected)
 
     def on_combo_changed(self, idx):
         if idx >= 0:
             appid = self.game_combo.itemData(idx)
-            self.selected_appid = appid
-            self.update_info(appid)
+            if appid:
+                self.selected_appid = appid
+                self.update_info_lazy(appid)
 
-    def update_info(self, appid):
+    def update_info_lazy(self, appid):
+        """Updates game info on-demand without freezing the UI."""
         self.selected_appid = appid
-        if not appid:
-            return
-
-        game = next((g for g in self.games if g["appid"] == appid), None)
-        is_running = game["running"] if game else False
-        pid = game.get("pid", "") if game else ""
+        is_running = appid in self.running_map
+        pid = self.running_map.get(appid, "")
 
         if is_running:
             self.status_line.setText(f"<span style='color: #22c55e; font-weight: bold;'>● Running (PID {pid})</span> - Proton active")
         else:
-            self.status_line.setText("<span style='color: #9ca3af;'>○ Offline</span> - Environment will be reconstructed")
+            self.status_line.setText("<span style='color: #9ca3af;'>○ Offline</span> - Environment reconstructed on run")
 
-        try:
-            p = subprocess.run([str(CLI_PATH), "info", str(appid)], capture_output=True, text=True)
-            pfx = "-"
-            proton = "-"
-            for line in p.stdout.splitlines():
-                if "Wine prefix:" in line:
-                    pfx = line.split(":", 1)[1].strip()
-                elif "Proton:" in line:
-                    proton = Path(line.split(":", 1)[1].strip()).parent.name
-            self.env_line.setText(f"<b>Proton:</b> {proton}  |  <b>Prefix:</b> {pfx}")
-        except Exception:
-            pass
+        # If already cached in memory, show instantly
+        if appid in self.details_cache:
+            data = self.details_cache[appid]
+            self.env_line.setText(f"<b>Proton:</b> {data.get('proton', '-')}  |  <b>Prefix:</b> {data.get('prefix', '-')}")
+            return
+
+        self.env_line.setText("<b>Proton:</b> loading...  |  <b>Prefix:</b> loading...")
+
+        # Fetch in background thread
+        if self.detail_worker and self.detail_worker.isRunning():
+            self.detail_worker.terminate()
+
+        self.detail_worker = DetailFetchWorker(appid, parent=self)
+        self.detail_worker.detail_ready.connect(self.on_detail_ready)
+        self.detail_worker.start()
+
+    def on_detail_ready(self, appid, data):
+        self.details_cache[appid] = data
+        if self.selected_appid == appid:
+            self.env_line.setText(f"<b>Proton:</b> {data.get('proton', '-')}  |  <b>Prefix:</b> {data.get('prefix', '-')}")
 
     def browse_exe(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -517,8 +742,8 @@ class MainWindow(QMainWindow):
             self.log("Please specify an executable to run.")
             return
 
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
+        if self.cmd_worker and self.cmd_worker.isRunning():
+            self.cmd_worker.stop()
 
         cmd = [str(CLI_PATH), "run", str(self.selected_appid), exe]
         args = self.args_input.text().strip()
@@ -529,10 +754,10 @@ class MainWindow(QMainWindow):
         self.log(f">> {' '.join(cmd)}")
         self.btn_run.setEnabled(False)
 
-        self.worker = CommandWorker(cmd, parent=self)
-        self.worker.output.connect(self.log)
-        self.worker.finished.connect(lambda: self.btn_run.setEnabled(True))
-        self.worker.start()
+        self.cmd_worker = CommandWorker(cmd, parent=self)
+        self.cmd_worker.output.connect(self.log)
+        self.cmd_worker.finished.connect(lambda: self.btn_run.setEnabled(True))
+        self.cmd_worker.start()
 
     def run_cmd(self):
         if not self.selected_appid:
@@ -545,25 +770,36 @@ class MainWindow(QMainWindow):
                 subprocess.Popen([term, "-e", f"{CLI_PATH} cmd {self.selected_appid}"])
             self.log(f">> Spawned cmd.exe in {Path(term).name}")
         else:
-            if self.worker and self.worker.isRunning():
-                self.worker.stop()
-            self.worker = CommandWorker([str(CLI_PATH), "cmd", str(self.selected_appid)], parent=self)
-            self.worker.output.connect(self.log)
-            self.worker.start()
+            if self.cmd_worker and self.cmd_worker.isRunning():
+                self.cmd_worker.stop()
+            self.cmd_worker = CommandWorker([str(CLI_PATH), "cmd", str(self.selected_appid)], parent=self)
+            self.cmd_worker.output.connect(self.log)
+            self.cmd_worker.start()
 
     def run_wine(self, tool):
         if not self.selected_appid:
             return
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
+        if self.cmd_worker and self.cmd_worker.isRunning():
+            self.cmd_worker.stop()
         self.log(f">> Running {tool} in prefix...")
-        self.worker = CommandWorker([str(CLI_PATH), "wine", str(self.selected_appid), tool], parent=self)
-        self.worker.output.connect(self.log)
-        self.worker.start()
+        self.cmd_worker = CommandWorker([str(CLI_PATH), "wine", str(self.selected_appid), tool], parent=self)
+        self.cmd_worker.output.connect(self.log)
+        self.cmd_worker.start()
 
     def open_pfx(self):
         if not self.selected_appid:
             return
+        cached = self.details_cache.get(self.selected_appid, {})
+        pfx_str = cached.get("prefix", "-")
+        if pfx_str and pfx_str != "-":
+            pfx = Path(pfx_str)
+            target = pfx / "drive_c" if (pfx / "drive_c").exists() else pfx
+            if target.exists():
+                subprocess.Popen(["xdg-open", str(target)])
+                self.log(f">> Opened: {target}")
+                return
+
+        # Fallback to CLI lookup in thread
         try:
             p = subprocess.run([str(CLI_PATH), "info", str(self.selected_appid)], capture_output=True, text=True)
             for line in p.stdout.splitlines():
@@ -579,17 +815,28 @@ class MainWindow(QMainWindow):
             self.log(f"Error: {e}")
 
     def closeEvent(self, event):
-        self.timer.stop()
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
+        self.poll_timer.stop()
+        for w in [self.discovery_worker, self.process_worker, self.detail_worker, self.cmd_worker]:
+            if w and w.isRunning():
+                w.stop() if hasattr(w, "stop") else w.terminate()
         super().closeEvent(event)
 
 
 def main():
+    t0 = time.perf_counter()
     app = QApplication(sys.argv)
     app.setApplicationName("Proton Runner")
+    log_timing("Qt Application initialization", t0)
+
+    t_win = time.perf_counter()
     win = MainWindow()
     win.show()
+    log_timing("MainWindow constructed & shown on screen", t_win)
+    log_timing("Total time to interactive window", t0)
+
+    # Trigger background non-blocking discovery after window is rendered
+    win.start_background_discovery()
+
     sys.exit(app.exec())
 
 
