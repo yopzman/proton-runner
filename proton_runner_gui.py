@@ -31,14 +31,15 @@ class CommandWorker(QThread):
     output = Signal(str)
     finished = Signal(int)
 
-    def __init__(self, command, cwd=None):
-        super().__init__()
+    def __init__(self, command, cwd=None, parent=None):
+        super().__init__(parent)
         self.command = command
         self.cwd = cwd
+        self._process = None
 
     def run(self):
         try:
-            p = subprocess.Popen(
+            self._process = subprocess.Popen(
                 self.command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -47,13 +48,22 @@ class CommandWorker(QThread):
                 bufsize=1,
                 universal_newlines=True
             )
-            for line in p.stdout:
+            for line in self._process.stdout:
                 self.output.emit(line)
-            p.wait()
-            self.finished.emit(p.returncode)
+            self._process.wait()
+            self.finished.emit(self._process.returncode)
         except Exception as e:
             self.output.emit(f"Error: {e}\n")
             self.finished.emit(1)
+
+    def stop(self):
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.terminate()
+            except Exception:
+                pass
+        self.terminate()
+        self.wait(500)
 
 
 class DoctorDialog(QDialog):
@@ -62,6 +72,7 @@ class DoctorDialog(QDialog):
         self.setWindowTitle(f"Diagnostics {f'- AppID {appid}' if appid else ''}")
         self.resize(600, 420)
         self.appid = appid
+        self.worker = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
@@ -95,13 +106,31 @@ class DoctorDialog(QDialog):
         self.run_diag()
 
     def run_diag(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+
         self.log.clear()
         cmd = [str(CLI_PATH), "doctor"]
         if self.appid:
             cmd.append(str(self.appid))
-        self.worker = CommandWorker(cmd)
+        self.worker = CommandWorker(cmd, parent=self)
         self.worker.output.connect(self.log.append)
         self.worker.start()
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+        super().closeEvent(event)
+
+    def reject(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+        super().reject()
+
+    def accept(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+        super().accept()
 
 
 class MainWindow(QMainWindow):
@@ -114,6 +143,7 @@ class MainWindow(QMainWindow):
         self.games = []
         self.selected_appid = None
         self.auto_detect = True
+        self.worker = None
 
         self.apply_theme()
         self.setup_ui()
@@ -487,6 +517,9 @@ class MainWindow(QMainWindow):
             self.log("Please specify an executable to run.")
             return
 
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+
         cmd = [str(CLI_PATH), "run", str(self.selected_appid), exe]
         args = self.args_input.text().strip()
         if args:
@@ -496,7 +529,7 @@ class MainWindow(QMainWindow):
         self.log(f">> {' '.join(cmd)}")
         self.btn_run.setEnabled(False)
 
-        self.worker = CommandWorker(cmd)
+        self.worker = CommandWorker(cmd, parent=self)
         self.worker.output.connect(self.log)
         self.worker.finished.connect(lambda: self.btn_run.setEnabled(True))
         self.worker.start()
@@ -512,15 +545,19 @@ class MainWindow(QMainWindow):
                 subprocess.Popen([term, "-e", f"{CLI_PATH} cmd {self.selected_appid}"])
             self.log(f">> Spawned cmd.exe in {Path(term).name}")
         else:
-            self.worker = CommandWorker([str(CLI_PATH), "cmd", str(self.selected_appid)])
+            if self.worker and self.worker.isRunning():
+                self.worker.stop()
+            self.worker = CommandWorker([str(CLI_PATH), "cmd", str(self.selected_appid)], parent=self)
             self.worker.output.connect(self.log)
             self.worker.start()
 
     def run_wine(self, tool):
         if not self.selected_appid:
             return
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
         self.log(f">> Running {tool} in prefix...")
-        self.worker = CommandWorker([str(CLI_PATH), "wine", str(self.selected_appid), tool])
+        self.worker = CommandWorker([str(CLI_PATH), "wine", str(self.selected_appid), tool], parent=self)
         self.worker.output.connect(self.log)
         self.worker.start()
 
@@ -540,6 +577,12 @@ class MainWindow(QMainWindow):
             self.log("Prefix directory not found.")
         except Exception as e:
             self.log(f"Error: {e}")
+
+    def closeEvent(self, event):
+        self.timer.stop()
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+        super().closeEvent(event)
 
 
 def main():
