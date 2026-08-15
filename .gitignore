@@ -9,6 +9,14 @@ venv/
 ENV/
 env/
 
+# Test and coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local cache directories
+.cache/
+
 # IDE / Editor files
 .vscode/
 .idea/

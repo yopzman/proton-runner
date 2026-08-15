@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Proton Runner - Fast, Asynchronous, Minimalist Qt6 Interface
+Proton Runner v0.2.0 - Fast, Asynchronous, Progressive Qt6 Interface
 for Steam Proton Environments.
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -17,15 +18,16 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QComboBox, QFileDialog,
     QTextEdit, QFrame, QCheckBox, QDialog
 )
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QObject
 
+VERSION = "0.2.0"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLI_PATH = SCRIPT_DIR / "proton-runner"
 if not CLI_PATH.exists():
     CLI_PATH = Path(shutil.which("proton-runner") or "proton-runner")
 
 CACHE_DIR = Path.home() / ".cache" / "proton-runner"
-CACHE_FILE = CACHE_DIR / "games_cache.json"
+CACHE_FILE = CACHE_DIR / "cache_v2.json"
 
 TIMING_ENABLED = "--timing" in sys.argv or os.environ.get("PROTON_RUNNER_TIMING") == "1"
 
@@ -42,9 +44,60 @@ def log_timing(tag, start_time):
         print(f"[STARTUP] {tag}: {elapsed:.3f}s")
 
 
-# --- Fast Native Python Discovery Helpers (Zero Subprocesses) ---
+# --- Fast Native Discovery Engine (No subprocess overhead) ---
+
+def parse_vdf_paths(vdf_path):
+    """Extract library paths from libraryfolders.vdf cleanly."""
+    paths = []
+    if not Path(vdf_path).is_file():
+        return paths
+    try:
+        with open(vdf_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if '"path"' in line:
+                    match = re.search(r'"path"\s+"([^"]+)"', line)
+                    if match:
+                        p = Path(match.group(1))
+                        if p.exists():
+                            paths.append(p.resolve())
+    except Exception:
+        pass
+    return paths
+
+
+def parse_acf_file(acf_path):
+    """Parse single appmanifest_*.acf file."""
+    appid = Path(acf_path).stem.replace("appmanifest_", "")
+    name = f"AppID {appid}"
+    last_played = 0
+    installdir = ""
+
+    try:
+        content = Path(acf_path).read_text(encoding="utf-8", errors="ignore")
+        name_match = re.search(r'"name"\s+"([^"]+)"', content)
+        if name_match:
+            name = name_match.group(1)
+
+        played_match = re.search(r'"LastPlayed"\s+"(\d+)"', content)
+        if played_match:
+            last_played = int(played_match.group(1))
+
+        dir_match = re.search(r'"installdir"\s+"([^"]+)"', content)
+        if dir_match:
+            installdir = dir_match.group(1)
+    except Exception:
+        pass
+
+    return {
+        "appid": appid,
+        "name": name,
+        "last_played": last_played,
+        "installdir": installdir
+    }
+
 
 def get_steam_roots():
+    """Discover valid Steam root paths."""
     candidates = [
         Path.home() / ".local/share/Steam",
         Path.home() / ".steam/steam",
@@ -67,28 +120,19 @@ def get_steam_roots():
     return roots
 
 
-def find_all_libraries():
-    roots = get_steam_roots()
+def find_libraries(steam_roots=None):
+    """Discover all active Steam library folders."""
+    roots = steam_roots or get_steam_roots()
     libs = set(roots)
     for root in roots:
         vdf = root / "steamapps" / "libraryfolders.vdf"
-        if vdf.exists():
-            try:
-                with open(vdf, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        if '"path"' in line:
-                            parts = line.split('"')
-                            if len(parts) >= 4:
-                                p = Path(parts[3])
-                                if p.exists():
-                                    libs.add(p.resolve())
-            except Exception:
-                pass
+        for p in parse_vdf_paths(vdf):
+            libs.add(p)
     return list(libs)
 
 
-def scan_installed_games_fast(libraries):
-    """Fast native Python parser for appmanifest_*.acf without shelling out."""
+def scan_games_in_libraries(libraries):
+    """Scan all installed games across discovered Steam libraries."""
     games = []
     seen_appids = set()
 
@@ -103,44 +147,60 @@ def scan_installed_games_fast(libraries):
             continue
 
         for acf in acf_files:
-            appid = acf.stem.replace("appmanifest_", "")
+            game_meta = parse_acf_file(acf)
+            appid = game_meta["appid"]
             if appid in seen_appids or not appid.isdigit():
                 continue
 
-            name = f"AppID {appid}"
-            last_played = 0
-            try:
-                with open(acf, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
-                        if '"name"' in line:
-                            parts = line.split('"')
-                            if len(parts) >= 4:
-                                name = parts[3]
-                        elif '"LastPlayed"' in line:
-                            parts = line.split('"')
-                            if len(parts) >= 4 and parts[3].isdigit():
-                                last_played = int(parts[3])
-            except Exception:
-                pass
-
-            name_lower = name.lower()
+            name_lower = game_meta["name"].lower()
             if any(k in name_lower for k in IGNORED_KEYWORDS):
                 continue
 
             seen_appids.add(appid)
-            games.append({
-                "appid": appid,
-                "name": name,
-                "last_played": last_played,
-                "library": str(lib)
-            })
+            game_meta["library"] = str(lib)
+            games.append(game_meta)
 
     games.sort(key=lambda g: (-g["last_played"], g["name"].lower()))
     return games
 
 
-def scan_running_games_fast():
-    """Fast native /proc parser to detect running Steam games without Bash overhead."""
+def scan_proton_installations(libraries=None):
+    """Locate Proton tools across compatibilitytools.d and common."""
+    search_dirs = []
+    roots = get_steam_roots()
+    for r in roots:
+        search_dirs.append(r / "compatibilitytools.d")
+        search_dirs.append(r / "steamapps" / "common")
+
+    libs = libraries or find_libraries(roots)
+    for lib in libs:
+        search_dirs.append(lib / "compatibilitytools.d")
+        search_dirs.append(lib / "steamapps" / "common")
+
+    protons = []
+    seen_paths = set()
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        try:
+            for p in d.iterdir():
+                if p.is_dir() and (p / "proton").is_file() and os.access(p / "proton", os.X_OK):
+                    real_p = (p / "proton").resolve()
+                    if real_p not in seen_paths:
+                        seen_paths.add(real_p)
+                        protons.append({
+                            "name": p.name,
+                            "path": str(real_p),
+                            "directory": str(p)
+                        })
+        except Exception:
+            continue
+
+    return protons
+
+
+def scan_running_processes():
+    """Fast /proc scanner to detect running Steam games."""
     running = {}
     my_uid = os.getuid()
 
@@ -151,7 +211,6 @@ def scan_running_games_fast():
 
     for p in proc_entries:
         try:
-            # Check owner
             stat = p.stat()
             if stat.st_uid != my_uid:
                 continue
@@ -194,50 +253,124 @@ def scan_running_games_fast():
     return running
 
 
-# --- Cache Management ---
+# --- Smart XDG Cache with Mtime Invalidation ---
 
-def load_cache():
-    if not CACHE_FILE.exists():
-        return None
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            # Valid if younger than 24 hours
-            if time.time() - data.get("timestamp", 0) < 86400:
-                return data.get("games", [])
-    except Exception:
-        pass
-    return None
+class SmartCache:
+    @staticmethod
+    def get_library_mtimes(libraries):
+        mtimes = {}
+        for lib in libraries:
+            vdf = lib / "steamapps" / "libraryfolders.vdf"
+            if vdf.is_file():
+                try:
+                    mtimes[str(vdf)] = vdf.stat().st_mtime
+                except Exception:
+                    pass
+            steamapps = lib / "steamapps"
+            if steamapps.is_dir():
+                try:
+                    mtimes[str(steamapps)] = steamapps.stat().st_mtime
+                except Exception:
+                    pass
+        return mtimes
+
+    @staticmethod
+    def load():
+        if not CACHE_FILE.is_file():
+            return None
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            if data.get("schema_version") != 2:
+                return None
+
+            # Expire if older than 24 hours
+            if time.time() - data.get("timestamp", 0) > 86400:
+                return None
+
+            # Validate mtimes
+            cached_mtimes = data.get("mtimes", {})
+            for path_str, cached_mtime in cached_mtimes.items():
+                p = Path(path_str)
+                if p.exists():
+                    if abs(p.stat().st_mtime - cached_mtime) > 0.001:
+                        return None
+                else:
+                    return None
+
+            return data.get("games", [])
+        except Exception:
+            return None
+
+    @staticmethod
+    def save(games, libraries, protons=None):
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            mtimes = SmartCache.get_library_mtimes(libraries)
+            payload = {
+                "schema_version": 2,
+                "timestamp": time.time(),
+                "mtimes": mtimes,
+                "libraries": [str(l) for l in libraries],
+                "games": games,
+                "protons": protons or []
+            }
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception:
+            pass
 
 
-def save_cache(games):
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"timestamp": time.time(), "games": games}, f)
-    except Exception:
-        pass
+# --- Progressive Discovery Pipeline (QThread) ---
 
-
-# --- Asynchronous Worker Threads ---
-
-class FastDiscoveryWorker(QThread):
-    games_ready = Signal(list)
+class ProgressiveDiscoveryWorker(QThread):
+    stage_started = Signal(str)
+    stage_progress = Signal(str, int, int)
+    stage_finished = Signal(str, object)
+    stage_error = Signal(str, str)
+    discovery_complete = Signal(list, list, dict)
 
     def run(self):
         t0 = time.perf_counter()
-        libs = find_all_libraries()
-        games = scan_installed_games_fast(libs)
-        save_cache(games)
-        log_timing("Background library & game discovery", t0)
-        self.games_ready.emit(games)
+
+        # Stage 1: Steam Roots
+        self.stage_started.emit("Steam Roots")
+        roots = get_steam_roots()
+        self.stage_finished.emit("Steam Roots", roots)
+
+        # Stage 2: Libraries
+        self.stage_started.emit("Libraries")
+        libs = find_libraries(roots)
+        self.stage_finished.emit("Libraries", libs)
+
+        # Stage 3: Installed Games
+        self.stage_started.emit("Games")
+        games = scan_games_in_libraries(libs)
+        self.stage_finished.emit("Games", games)
+
+        # Stage 4: Proton Tools
+        self.stage_started.emit("Proton Versions")
+        protons = scan_proton_installations(libs)
+        self.stage_finished.emit("Proton Versions", protons)
+
+        # Stage 5: Running Processes
+        self.stage_started.emit("Process Scan")
+        running = scan_running_processes()
+        self.stage_finished.emit("Process Scan", running)
+
+        # Cache update
+        SmartCache.save(games, libs, protons)
+
+        log_timing("Progressive discovery pipeline", t0)
+        self.discovery_complete.emit(games, protons, running)
 
 
 class ProcessScanWorker(QThread):
     running_ready = Signal(dict)
 
     def run(self):
-        running = scan_running_games_fast()
+        running = scan_running_processes()
         self.running_ready.emit(running)
 
 
@@ -378,6 +511,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(560, 440)
 
         self.games = []
+        self.protons = []
         self.running_map = {}
         self.selected_appid = None
         self.auto_detect = True
@@ -393,8 +527,8 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         log_timing("MainWindow UI setup", t_init)
 
-        # Load instant disk cache if present
-        cached_games = load_cache()
+        # Load instant disk cache if available
+        cached_games = SmartCache.load()
         if cached_games:
             self.games = cached_games
             self.update_combo()
@@ -490,7 +624,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        # 1. Top Bar: Game Selector & Controls
+        # 1. Top Bar: Target Game Selector & Auto-detect
         top = QHBoxLayout()
         top.setSpacing(8)
 
@@ -616,26 +750,28 @@ class MainWindow(QMainWindow):
         self.log_view.append(text.rstrip())
 
     def start_background_discovery(self):
-        """Asynchronously scan Steam libraries without blocking the Qt event loop."""
+        """Asynchronously trigger the progressive discovery pipeline."""
         if self.discovery_worker and self.discovery_worker.isRunning():
             return
-        self.discovery_worker = FastDiscoveryWorker(parent=self)
-        self.discovery_worker.games_ready.connect(self.on_games_discovered)
+        self.discovery_worker = ProgressiveDiscoveryWorker(parent=self)
+        self.discovery_worker.discovery_complete.connect(self.on_discovery_complete)
         self.discovery_worker.start()
 
         # Trigger process scan simultaneously
         self.trigger_process_scan()
 
     def trigger_process_scan(self):
-        """Asynchronously scan /proc for running Steam games without blocking."""
+        """Asynchronously scan /proc for running Steam games."""
         if self.process_worker and self.process_worker.isRunning():
             return
         self.process_worker = ProcessScanWorker(parent=self)
         self.process_worker.running_ready.connect(self.on_running_processes_ready)
         self.process_worker.start()
 
-    def on_games_discovered(self, games):
+    def on_discovery_complete(self, games, protons, running):
         self.games = games
+        self.protons = protons
+        self.running_map = running
         self.update_combo()
 
     def on_running_processes_ready(self, running_map):
@@ -713,7 +849,6 @@ class MainWindow(QMainWindow):
 
         self.env_line.setText("<b>Proton:</b> loading...  |  <b>Prefix:</b> loading...")
 
-        # Fetch in background thread
         if self.detail_worker and self.detail_worker.isRunning():
             self.detail_worker.terminate()
 
@@ -799,7 +934,6 @@ class MainWindow(QMainWindow):
                 self.log(f">> Opened: {target}")
                 return
 
-        # Fallback to CLI lookup in thread
         try:
             p = subprocess.run([str(CLI_PATH), "info", str(self.selected_appid)], capture_output=True, text=True)
             for line in p.stdout.splitlines():
@@ -834,7 +968,7 @@ def main():
     log_timing("MainWindow constructed & shown on screen", t_win)
     log_timing("Total time to interactive window", t0)
 
-    # Trigger background non-blocking discovery after window is rendered
+    # Start progressive background discovery
     win.start_background_discovery()
 
     sys.exit(app.exec())

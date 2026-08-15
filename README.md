@@ -6,19 +6,35 @@ Run auxiliary Windows tools (`.exe`, `.bat`, mod loaders, debugging utilities) a
 
 Supports live process detection: if the game is already running, `proton-runner` attaches to its active Proton environment and Wine prefix automatically. If offline, it reconstructs the environment from Steam libraries and `compatdata`.
 
-Available as both a CLI tool and a fast, compact Qt6 desktop GUI (< 0.15s instant startup).
+Available as both a standalone Bash CLI tool and an ultra-fast, compact Qt6 desktop GUI (< 0.15s instant startup).
+
+---
+
+## What's New in v0.2.0
+
+- **Instant Window Startup (< 0.15s):** Window renders immediately before background operations.
+- **Progressive Discovery Pipeline:** Non-blocking `QThread` stages discover Steam roots, libraries, game ACF metadata, and Proton tools without freezing the UI.
+- **Smart XDG Caching (`~/.cache/proton-runner/`):** Instant launch (< 1ms) with timestamp and mtime invalidation when libraries or manifests change.
+- **Lazy Detail Inspector:** Detailed Wine prefix and Proton path resolution loaded on-demand per game.
+- **Automated Test Suite:** Comprehensive unit & integration tests (`tests/`) for VDF/ACF parsers, caching, discovery, and CLI subcommands.
+
+---
+
+## Requirements
+
+- **CLI Core:** Linux with Bash 4.4+ and standard POSIX utilities (`awk`, `sed`, `grep`, `pgrep`, `find`).
+- **Desktop GUI:** Python 3.10+ with `PySide6` (`pip install PySide6` or distribution package like `python-pyside6`).
 
 ---
 
 ## Features
 
-- **Instant GUI Startup (< 0.15s):** Asynchronous non-blocking architecture ensures the window renders immediately while Steam libraries and games are discovered in the background.
 - **Process Auto-Detection:** Inspects `/proc/<pid>/environ` (safely via NUL-byte parsing) to capture live `STEAM_COMPAT_*` variables, `WINEPREFIX`, and Proton binary paths in real time.
 - **Offline Environment Reconstruction:** Finds installed games, compatdata prefixes, and Proton versions across multiple Steam library folders (`libraryfolders.vdf`).
 - **Path Handling:** Translates Linux absolute/relative paths and Windows drive paths (`C:\...`, `Z:\...`).
 - **Prefix Utilities:** One-click / one-command shortcuts to launch `cmd.exe`, `winecfg`, `regedit`, or open the prefix directory.
 - **Doctor Diagnostics:** Built-in health check for Steam libraries, filesystems (with NTFS warnings), prefix permissions, and Proton installations.
-- **Smart Caching:** Caches static library data in `~/.cache/proton-runner/` with automatic refresh on change.
+- **Robust Error Isolation:** Tolerates missing Steam roots, unmounted disks, and corrupted manifests gracefully.
 
 ---
 
@@ -53,8 +69,8 @@ proton-runner
 proton-runner gui
 ```
 
-#### Performance & Benchmark Mode
-Measure startup timings:
+#### Benchmark & Timing Mode
+Inspect startup timings:
 ```bash
 proton-runner gui --timing
 ```
@@ -113,13 +129,12 @@ proton-runner doctor 3513350
 
 ---
 
-## Architecture & Performance
+## Running the Test Suite
 
-`proton-runner` uses a multi-tiered architecture:
-1. **Immediate Rendering:** `window.show()` is called first (< 0.15s).
-2. **Asynchronous Library Discovery:** `FastDiscoveryWorker` scans Steam libraries in a separate background thread (`QThread`) without blocking the main event loop.
-3. **Non-blocking Process Polling:** `ProcessScanWorker` inspects `/proc` without spawning blocking subshells.
-4. **Lazy Detail Loading:** Prefix and Proton paths are retrieved on-demand and cached in memory.
+Run the automated unit and integration tests:
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ---
 

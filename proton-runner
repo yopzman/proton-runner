@@ -8,7 +8,7 @@
 
 set -u
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SCRIPT_NAME="$(basename "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
 GUI_SCRIPT="$SCRIPT_DIR/proton_runner_gui.py"
