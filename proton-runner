@@ -1,0 +1,1291 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# proton-runner
+#
+# A practical Linux CLI and GUI tool to inspect, configure, and run
+# Windows/Linux programs inside a Steam game's Proton environment.
+# ==============================================================================
+
+set -u
+
+VERSION="0.1.0"
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" && pwd)"
+GUI_SCRIPT="$SCRIPT_DIR/proton_runner_gui.py"
+
+# --- Output Formatting & Colors ---
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    C_RESET="\033[0m"
+    C_BOLD="\033[1m"
+    C_DIM="\033[2m"
+    C_RED="\033[1;31m"
+    C_GREEN="\033[1;32m"
+    C_YELLOW="\033[1;33m"
+    C_BLUE="\033[1;34m"
+    C_CYAN="\033[1;36m"
+else
+    C_RESET=""
+    C_BOLD=""
+    C_DIM=""
+    C_RED=""
+    C_GREEN=""
+    C_YELLOW=""
+    C_BLUE=""
+    C_CYAN=""
+fi
+
+die() {
+    echo -e "${C_RED}Error:${C_RESET} $*" >&2
+    exit 1
+}
+
+warn() {
+    echo -e "${C_YELLOW}Warning:${C_RESET} $*" >&2
+}
+
+info() {
+    echo -e "${C_BLUE}Info:${C_RESET} $*"
+}
+
+success() {
+    echo -e "${C_GREEN}Success:${C_RESET} $*"
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Global State
+declare -gA ACTIVE_ENV=()
+IS_GAME_RUNNING=0
+RUNNING_PID=""
+ENV_STEAM_COMPAT_APP_ID=""
+ENV_STEAM_COMPAT_DATA_PATH=""
+ENV_STEAM_COMPAT_INSTALL_PATH=""
+ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH=""
+ENV_STEAM_COMPAT_LIBRARY_PATHS=""
+ENV_WINEPREFIX=""
+ENV_STEAM_APP_ID=""
+ENV_STEAM_GAME_ID=""
+ENV_PROTON_LOG=""
+ENV_PROTON_LOG_DIR=""
+ENV_WINEDLLOVERRIDES=""
+PROTON_BIN=""
+
+# --- Security Checks ---
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    warn "Running as root/sudo is not recommended and can break Steam Wine prefix permissions."
+fi
+
+# --- Helper: Safe /proc environ extractor ---
+# Reads NUL-delimited /proc/<PID>/environ safely into a bash associative array.
+# Usage: read_proc_environ <PID> <target_assoc_array_name>
+read_proc_environ() {
+    local pid="$1"
+    local -n out_map="$2"
+    local environ_file="/proc/${pid}/environ"
+
+    if ! ( : < "$environ_file" ) 2>/dev/null; then
+        return 1
+    fi
+
+    while IFS= read -r -d '' item; do
+        local key="${item%%=*}"
+        local val="${item#*=}"
+        if [[ -n "$key" ]]; then
+            out_map["$key"]="$val"
+        fi
+    done < "$environ_file" 2>/dev/null || return 1
+
+    return 0
+}
+
+# Helper: Get candidate PIDs to scan (user's processes)
+get_user_pids() {
+    local my_uid="${EUID:-$(id -u)}"
+    if command_exists pgrep; then
+        pgrep -u "$my_uid" 2>/dev/null || true
+    else
+        for p in /proc/[0-9]*; do
+            [[ -d "$p" ]] || continue
+            echo "${p#/proc/}"
+        done
+    fi
+}
+
+# --- Steam Path Discovery ---
+
+# Find potential Steam root paths
+find_steam_roots() {
+    local candidates=(
+        "${XDG_DATA_HOME:-$HOME/.local/share}/Steam"
+        "$HOME/.steam/steam"
+        "$HOME/.steam/root"
+        "$HOME/.steam"
+        "$HOME/.local/share/Steam"
+        "$HOME/.var/app/com.valvesoftware.Steam/.steam/steam"
+        "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+    )
+
+    local seen=()
+    for dir in "${candidates[@]}"; do
+        if [[ -d "$dir" ]]; then
+            local real_path
+            real_path="$(realpath "$dir" 2>/dev/null || true)"
+            if [[ -n "$real_path" && -d "$real_path" ]]; then
+                # deduplicate
+                local duplicate=0
+                for s in "${seen[@]:-}"; do
+                    if [[ "$s" == "$real_path" ]]; then
+                        duplicate=1
+                        break
+                    fi
+                done
+                if [[ "$duplicate" -eq 0 ]]; then
+                    seen+=("$real_path")
+                    echo "$real_path"
+                fi
+            fi
+        fi
+    done
+}
+
+# Primary Steam root
+get_primary_steam_root() {
+    local roots=()
+    while IFS= read -r r; do
+        [[ -n "$r" ]] && roots+=("$r")
+    done < <(find_steam_roots)
+
+    if [[ ${#roots[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    # Prefer one that has steamapps or config
+    for r in "${roots[@]}"; do
+        if [[ -d "$r/steamapps" || -f "$r/config/config.vdf" ]]; then
+            echo "$r"
+            return 0
+        fi
+    done
+
+    echo "${roots[0]}"
+    return 0
+}
+
+# Find all Steam libraries across all detected roots & libraryfolders.vdf
+find_steam_libraries() {
+    local libraries=()
+    local seen=()
+
+    add_lib() {
+        local path="$1"
+        if [[ -n "$path" && -d "$path" ]]; then
+            local real_p
+            real_p="$(realpath "$path" 2>/dev/null || true)"
+            if [[ -n "$real_p" && -d "$real_p" ]]; then
+                for s in "${seen[@]:-}"; do
+                    if [[ "$s" == "$real_p" ]]; then
+                        return
+                    fi
+                done
+                seen+=("$real_p")
+                libraries+=("$real_p")
+            fi
+        fi
+    }
+
+    local steam_roots=()
+    while IFS= read -r r; do
+        [[ -n "$r" ]] && steam_roots+=("$r")
+    done < <(find_steam_roots)
+
+    for root in "${steam_roots[@]}"; do
+        add_lib "$root"
+
+        local vdf="$root/steamapps/libraryfolders.vdf"
+        if [[ -f "$vdf" ]]; then
+            while IFS= read -r lib_path; do
+                [[ -n "$lib_path" ]] && add_lib "$lib_path"
+            done < <(awk -F'"' '$2 == "path" { print $4 }' "$vdf" 2>/dev/null || true)
+        fi
+    done
+
+    for lib in "${libraries[@]}"; do
+        echo "$lib"
+    done
+}
+
+# Find App Manifest for AppID
+find_app_manifest() {
+    local appid="$1"
+    while IFS= read -r lib; do
+        local acf="$lib/steamapps/appmanifest_${appid}.acf"
+        if [[ -f "$acf" ]]; then
+            echo "$acf"
+            return 0
+        fi
+    done < <(find_steam_libraries)
+    return 1
+}
+
+# Parse ACF value helper
+get_acf_value() {
+    local acf_file="$1"
+    local key="$2"
+    if [[ ! -f "$acf_file" ]]; then
+        return 1
+    fi
+    awk -F'"' -v k="$key" '$2 == k { print $4; exit }' "$acf_file"
+}
+
+# Get human-readable game name
+get_game_name() {
+    local appid="$1"
+    local acf
+    if acf="$(find_app_manifest "$appid" 2>/dev/null)"; then
+        local name
+        name="$(get_acf_value "$acf" "name")"
+        if [[ -n "$name" ]]; then
+            echo "$name"
+            return 0
+        fi
+    fi
+
+    # Fallback to checking running processes
+    local pids=()
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && pids+=("$p")
+    done < <(find_running_pids_for_appid "$appid")
+
+    if [[ ${#pids[@]} -gt 0 ]]; then
+        local comm
+        comm="$(ps -p "${pids[0]}" -o comm= 2>/dev/null || true)"
+        if [[ -n "$comm" ]]; then
+            echo "$comm"
+            return 0
+        fi
+    fi
+
+    echo "Unknown AppID $appid"
+    return 0
+}
+
+# Find game install directory
+find_game_directory() {
+    local appid="$1"
+    local acf
+    if acf="$(find_app_manifest "$appid" 2>/dev/null)"; then
+        local installdir
+        installdir="$(get_acf_value "$acf" "installdir")"
+        local lib_dir
+        lib_dir="$(dirname "$(dirname "$acf")")"
+        local full_dir="$lib_dir/steamapps/common/$installdir"
+        if [[ -d "$full_dir" ]]; then
+            echo "$full_dir"
+            return 0
+        fi
+    fi
+
+    # Fallback: search common directories in all libraries
+    while IFS= read -r lib; do
+        local common="$lib/steamapps/common"
+        if [[ -d "$common" ]]; then
+            if [[ -d "$common/$appid" ]]; then
+                echo "$common/$appid"
+                return 0
+            fi
+        fi
+    done < <(find_steam_libraries)
+
+    return 1
+}
+
+# Find compatdata directory
+find_compatdata() {
+    local appid="$1"
+    # Check all libraries
+    while IFS= read -r lib; do
+        local cd="$lib/steamapps/compatdata/$appid"
+        if [[ -d "$cd" ]]; then
+            echo "$cd"
+            return 0
+        fi
+    done < <(find_steam_libraries)
+
+    # Check primary root default
+    local primary
+    if primary="$(get_primary_steam_root 2>/dev/null)"; then
+        local default_cd="$primary/steamapps/compatdata/$appid"
+        echo "$default_cd"
+        return 0
+    fi
+
+    return 1
+}
+
+# Find Wine prefix (pfx)
+find_prefix() {
+    local appid="$1"
+    local cd
+    cd="$(find_compatdata "$appid" 2>/dev/null || true)"
+    if [[ -n "$cd" ]]; then
+        echo "$cd/pfx"
+        return 0
+    fi
+    return 1
+}
+
+# --- Process & Live Environment Detection ---
+
+find_running_pids_for_appid() {
+    local appid="$1"
+    local matched_pids=()
+
+    while IFS= read -r pid; do
+        [[ -n "$pid" && -d "/proc/$pid" ]] || continue
+
+        # 1. Inspect /proc/<pid>/environ
+        if ( : < "/proc/$pid/environ" ) 2>/dev/null; then
+            declare -A proc_env=()
+            if read_proc_environ "$pid" proc_env; then
+                local env_appid="${proc_env["STEAM_COMPAT_APP_ID"]:-${proc_env["SteamAppId"]:-${proc_env["SteamGameId"]:-}}}"
+                if [[ "$env_appid" == "$appid" ]]; then
+                    matched_pids+=("$pid")
+                    unset proc_env
+                    continue
+                fi
+
+                # Check if WINEPREFIX contains compatdata/appid
+                local wp="${proc_env["WINEPREFIX"]:-}"
+                if [[ "$wp" =~ /compatdata/${appid}(/|$) ]]; then
+                    matched_pids+=("$pid")
+                    unset proc_env
+                    continue
+                fi
+            fi
+            unset proc_env
+        fi
+
+        # 2. Inspect /proc/<pid>/cmdline as fallback
+        if ( : < "/proc/$pid/cmdline" ) 2>/dev/null; then
+            local cmdline
+            cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+            if [[ "$cmdline" =~ AppId=${appid} || "$cmdline" =~ /compatdata/${appid}(/|[[:space:]]) || "$cmdline" =~ appmanifest_${appid}\.acf || "$cmdline" =~ -applaunch[[:space:]]+${appid} ]]; then
+                matched_pids+=("$pid")
+                continue
+            fi
+        fi
+    done < <(get_user_pids)
+
+    for p in "${matched_pids[@]}"; do
+        echo "$p"
+    done
+}
+
+# Scan all running Steam games and output: APPID PID GAME_NAME
+list_running_games() {
+    declare -A seen_apps=()
+
+    while IFS= read -r pid; do
+        [[ -n "$pid" && -d "/proc/$pid" ]] || continue
+
+        local detected_appid=""
+        if ( : < "/proc/$pid/environ" ) 2>/dev/null; then
+            declare -A proc_env=()
+            if read_proc_environ "$pid" proc_env; then
+                detected_appid="${proc_env["STEAM_COMPAT_APP_ID"]:-${proc_env["SteamAppId"]:-${proc_env["SteamGameId"]:-}}}"
+                if [[ -z "$detected_appid" ]]; then
+                    local wp="${proc_env["WINEPREFIX"]:-}"
+                    if [[ "$wp" =~ /compatdata/([0-9]+)(/|$) ]]; then
+                        detected_appid="${BASH_REMATCH[1]}"
+                    fi
+                fi
+            fi
+            unset proc_env
+        fi
+
+        if [[ -z "$detected_appid" ]] && ( : < "/proc/$pid/cmdline" ) 2>/dev/null; then
+            local cmdline
+            cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+            if [[ "$cmdline" =~ AppId=([0-9]+) ]]; then
+                detected_appid="${BASH_REMATCH[1]}"
+            elif [[ "$cmdline" =~ /compatdata/([0-9]+) ]]; then
+                detected_appid="${BASH_REMATCH[1]}"
+            fi
+        fi
+
+        # Ignore Steam client internal appids like 0
+        if [[ -n "$detected_appid" && "$detected_appid" != "0" ]]; then
+            if [[ -z "${seen_apps["$detected_appid"]:-}" ]]; then
+                seen_apps["$detected_appid"]="$pid"
+            fi
+        fi
+    done < <(get_user_pids)
+
+    for appid in "${!seen_apps[@]}"; do
+        local pid="${seen_apps["$appid"]}"
+        local name
+        name="$(get_game_name "$appid")"
+        echo -e "${appid}\t${pid}\t${name}"
+    done
+}
+
+# --- Proton Discovery Engine ---
+
+# Parse Steam config.vdf for CompatToolMapping
+get_config_vdf_compat_tool() {
+    local appid="$1"
+    local steam_root
+    steam_root="$(get_primary_steam_root 2>/dev/null || true)"
+    [[ -n "$steam_root" ]] || return 1
+
+    local config_vdf="$steam_root/config/config.vdf"
+    [[ -f "$config_vdf" ]] || return 1
+
+    # Extract mapping for specific AppID
+    local tool
+    tool="$(awk -v app="$appid" '
+        BEGIN { in_map = 0; in_app = 0; }
+        /"CompatToolMapping"/ { in_map = 1; next }
+        in_map && $1 == "\"" app "\"" { in_app = 1; next }
+        in_map && in_app && /"name"/ { print $2; exit }
+        in_map && in_app && /}/ { in_app = 0 }
+        in_map && /^(\t| ){2}}/ { in_map = 0 }
+    ' "$config_vdf" | tr -d '"')"
+
+    if [[ -n "$tool" ]]; then
+        echo "$tool"
+        return 0
+    fi
+
+    # Fallback to default tool (AppID "0")
+    tool="$(awk '
+        BEGIN { in_map = 0; in_app = 0; }
+        /"CompatToolMapping"/ { in_map = 1; next }
+        in_map && $1 == "\"0\"" { in_app = 1; next }
+        in_map && in_app && /"name"/ { print $2; exit }
+        in_map && in_app && /}/ { in_app = 0 }
+        in_map && /^(\t| ){2}}/ { in_map = 0 }
+    ' "$config_vdf" | tr -d '"')"
+
+    if [[ -n "$tool" ]]; then
+        echo "$tool"
+        return 0
+    fi
+
+    return 1
+}
+
+# Find Proton installation directory & executable
+# Returns: <path_to_proton_binary>
+find_proton() {
+    local appid="${1:-}"
+    local requested_tool=""
+
+    # 1. If game is running, check process environment for Proton path
+    if [[ -n "$appid" ]]; then
+        local pids=()
+        while IFS= read -r p; do
+            [[ -n "$p" ]] && pids+=("$p")
+        done < <(find_running_pids_for_appid "$appid")
+
+        for p in "${pids[@]}"; do
+            declare -A penv=()
+            if read_proc_environ "$p" penv; then
+                if [[ -n "${penv["STEAM_COMPAT_TOOL_PATHS"]:-}" ]]; then
+                    local tool_path="${penv["STEAM_COMPAT_TOOL_PATHS"]%%:*}"
+                    if [[ -x "$tool_path/proton" ]]; then
+                        echo "$tool_path/proton"
+                        return 0
+                    fi
+                fi
+            fi
+            unset penv
+        done
+    fi
+
+    # 2. Check compatdata/<appid>/config_info or version
+    if [[ -n "$appid" ]]; then
+        local cd
+        cd="$(find_compatdata "$appid" 2>/dev/null || true)"
+        if [[ -n "$cd" && -f "$cd/config_info" ]]; then
+            local tool_name
+            tool_name="$(head -n 1 "$cd/config_info" | tr -d '\r\n')"
+            if [[ -n "$tool_name" ]]; then
+                requested_tool="$tool_name"
+            fi
+        elif [[ -n "$cd" && -f "$cd/version" ]]; then
+            local ver_name
+            ver_name="$(head -n 1 "$cd/version" | tr -d '\r\n')"
+            if [[ -n "$ver_name" ]]; then
+                requested_tool="$ver_name"
+            fi
+        fi
+    fi
+
+    # 3. Check Steam config.vdf CompatToolMapping
+    if [[ -z "$requested_tool" && -n "$appid" ]]; then
+        requested_tool="$(get_config_vdf_compat_tool "$appid" 2>/dev/null || true)"
+    fi
+
+    # Search paths for compatibility tools
+    local search_roots=()
+    while IFS= read -r r; do
+        [[ -n "$r" ]] && search_roots+=("$r")
+    done < <(find_steam_roots)
+
+    while IFS= read -r l; do
+        [[ -n "$l" ]] && search_roots+=("$l")
+    done < <(find_steam_libraries)
+
+    search_roots+=(
+        "$HOME/.local/share/Steam"
+        "$HOME/.steam/root"
+        "$HOME/.steam/steam"
+        "/usr/share/steam"
+        "/usr/local/share/steam"
+    )
+
+    # If we have a specific tool name, look for it first
+    if [[ -n "$requested_tool" ]]; then
+        for root in "${search_roots[@]}"; do
+            # Check compatibilitytools.d/<name>/proton
+            if [[ -x "$root/compatibilitytools.d/$requested_tool/proton" ]]; then
+                echo "$root/compatibilitytools.d/$requested_tool/proton"
+                return 0
+            fi
+            # Check steamapps/common/<name>/proton
+            if [[ -x "$root/steamapps/common/$requested_tool/proton" ]]; then
+                echo "$root/steamapps/common/$requested_tool/proton"
+                return 0
+            fi
+            # Check direct directory match if name was full path
+            if [[ -x "$requested_tool/proton" ]]; then
+                echo "$requested_tool/proton"
+                return 0
+            fi
+        done
+
+        # Try partial / sanitized name matches (e.g. proton-cachyos, GE-Proton)
+        for root in "${search_roots[@]}"; do
+            for candidate in "$root/compatibilitytools.d"/* "$root/steamapps/common"/Proton* "$root/steamapps/common"/*Proton*; do
+                if [[ -d "$candidate" && -x "$candidate/proton" ]]; then
+                    local base
+                    base="$(basename "$candidate")"
+                    if [[ "$base" == *"$requested_tool"* || "$requested_tool" == *"$base"* ]]; then
+                        echo "$candidate/proton"
+                        return 0
+                    fi
+                fi
+            done
+        done
+    fi
+
+    # Fallback: Look for ANY installed Proton (prefer GE-Proton, Proton Experimental, Proton 10/9/8)
+    local found_protons=()
+    for root in "${search_roots[@]}"; do
+        for p_dir in "$root/compatibilitytools.d"/* "$root/steamapps/common"/Proton* "$root/steamapps/common"/*Proton*; do
+            if [[ -d "$p_dir" && -x "$p_dir/proton" ]]; then
+                local real_p
+                real_p="$(realpath "$p_dir/proton" 2>/dev/null || true)"
+                if [[ -n "$real_p" && -x "$real_p" ]]; then
+                    # deduplicate
+                    local dup=0
+                    for fp in "${found_protons[@]:-}"; do
+                        if [[ "$fp" == "$real_p" ]]; then
+                            dup=1
+                            break
+                        fi
+                    done
+                    if [[ "$dup" -eq 0 ]]; then
+                        found_protons+=("$real_p")
+                    fi
+                fi
+            fi
+        done
+    done
+
+    if [[ ${#found_protons[@]} -gt 0 ]]; then
+        # Pick the newest or best candidate
+        echo "${found_protons[0]}"
+        return 0
+    fi
+
+    return 1
+}
+
+# --- Steam Linux Runtime (pressure-vessel) Handling ---
+
+find_steam_linux_runtime() {
+    local search_libs=()
+    while IFS= read -r l; do
+        [[ -n "$l" ]] && search_libs+=("$l")
+    done < <(find_steam_libraries)
+
+    for lib in "${search_libs[@]}"; do
+        for slr_dir in "$lib/steamapps/common"/SteamLinuxRuntime* "$lib/steamapps/common"/SteamLinuxRuntime_*; do
+            if [[ -d "$slr_dir" && -x "$slr_dir/_v2-entry-point" ]]; then
+                echo "$slr_dir"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# --- Environment Builder ---
+
+# Reconstructs or extracts the Proton environment for an AppID
+# Sets: STEAM_COMPAT_APP_ID, STEAM_COMPAT_DATA_PATH, STEAM_COMPAT_INSTALL_PATH,
+#       STEAM_COMPAT_CLIENT_INSTALL_PATH, STEAM_COMPAT_LIBRARY_PATHS, WINEPREFIX, PROTON_BIN
+build_game_env() {
+    local appid="$1"
+
+    # Reset active env
+    ACTIVE_ENV=()
+    IS_GAME_RUNNING=0
+    RUNNING_PID=""
+
+    # Check if game is currently running
+    local pids=()
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && pids+=("$p")
+    done < <(find_running_pids_for_appid "$appid")
+
+    if [[ ${#pids[@]} -gt 0 ]]; then
+        for p in "${pids[@]}"; do
+            if read_proc_environ "$p" ACTIVE_ENV; then
+                IS_GAME_RUNNING=1
+                RUNNING_PID="$p"
+                break
+            fi
+        done
+    fi
+
+    # 1. STEAM_COMPAT_APP_ID
+    ENV_STEAM_COMPAT_APP_ID="${ACTIVE_ENV["STEAM_COMPAT_APP_ID"]:-$appid}"
+
+    # 2. STEAM_COMPAT_DATA_PATH & WINEPREFIX
+    ENV_STEAM_COMPAT_DATA_PATH="${ACTIVE_ENV["STEAM_COMPAT_DATA_PATH"]:-}"
+    if [[ -z "$ENV_STEAM_COMPAT_DATA_PATH" ]]; then
+        ENV_STEAM_COMPAT_DATA_PATH="$(find_compatdata "$appid" 2>/dev/null || true)"
+    fi
+    if [[ -z "$ENV_STEAM_COMPAT_DATA_PATH" ]]; then
+        local primary
+        primary="$(get_primary_steam_root 2>/dev/null || true)"
+        ENV_STEAM_COMPAT_DATA_PATH="$primary/steamapps/compatdata/$appid"
+    fi
+    ENV_WINEPREFIX="${ACTIVE_ENV["WINEPREFIX"]:-$ENV_STEAM_COMPAT_DATA_PATH/pfx}"
+
+    # 3. STEAM_COMPAT_CLIENT_INSTALL_PATH
+    ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH="${ACTIVE_ENV["STEAM_COMPAT_CLIENT_INSTALL_PATH"]:-}"
+    if [[ -z "$ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH" ]]; then
+        ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH="$(get_primary_steam_root 2>/dev/null || true)"
+    fi
+
+    # 4. STEAM_COMPAT_INSTALL_PATH (Game directory)
+    ENV_STEAM_COMPAT_INSTALL_PATH="${ACTIVE_ENV["STEAM_COMPAT_INSTALL_PATH"]:-}"
+    if [[ -z "$ENV_STEAM_COMPAT_INSTALL_PATH" ]]; then
+        ENV_STEAM_COMPAT_INSTALL_PATH="$(find_game_directory "$appid" 2>/dev/null || true)"
+    fi
+    if [[ -z "$ENV_STEAM_COMPAT_INSTALL_PATH" ]]; then
+        ENV_STEAM_COMPAT_INSTALL_PATH="$ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH/steamapps/common/$(get_game_name "$appid")"
+    fi
+
+    # 5. STEAM_COMPAT_LIBRARY_PATHS
+    ENV_STEAM_COMPAT_LIBRARY_PATHS="${ACTIVE_ENV["STEAM_COMPAT_LIBRARY_PATHS"]:-}"
+    if [[ -z "$ENV_STEAM_COMPAT_LIBRARY_PATHS" ]]; then
+        local libs=()
+        while IFS= read -r l; do
+            [[ -n "$l" ]] && libs+=("$l")
+        done < <(find_steam_libraries)
+        ENV_STEAM_COMPAT_LIBRARY_PATHS="$(IFS=:; echo "${libs[*]}")"
+    fi
+
+    # 6. Additional Proton / Wine variables
+    ENV_STEAM_APP_ID="${ACTIVE_ENV["SteamAppId"]:-$appid}"
+    ENV_STEAM_GAME_ID="${ACTIVE_ENV["SteamGameId"]:-$appid}"
+    ENV_PROTON_LOG="${ACTIVE_ENV["PROTON_LOG"]:-${PROTON_LOG:-}}"
+    ENV_PROTON_LOG_DIR="${ACTIVE_ENV["PROTON_LOG_DIR"]:-${PROTON_LOG_DIR:-}}"
+    ENV_WINEDLLOVERRIDES="${ACTIVE_ENV["WINEDLLOVERRIDES"]:-${WINEDLLOVERRIDES:-}}"
+
+    # 7. Locate Proton Binary
+    PROTON_BIN="$(find_proton "$appid" 2>/dev/null || true)"
+}
+
+# --- Path Translation & Validation Helpers ---
+
+# Resolves Windows or Linux path to appropriate target format for Proton
+# Usage: resolve_program_target <PROGRAM>
+resolve_program_target() {
+    local input_path="$1"
+
+    # Check if Windows path (e.g. C:\Tools\tool.exe or Z:\home\user\tool.exe)
+    if [[ "$input_path" =~ ^[A-Za-z]:(\\|/) ]]; then
+        # Windows path: pass directly to proton/wine
+        echo "$input_path"
+        return 0
+    fi
+
+    # If it's a relative or absolute Linux path
+    local resolved
+    if [[ "$input_path" = /* ]]; then
+        resolved="$input_path"
+    else
+        resolved="$(realpath "$input_path" 2>/dev/null || echo "$PWD/$input_path")"
+    fi
+
+    if [[ ! -e "$resolved" && ! -e "$input_path" ]]; then
+        echo -e "${C_RED}Error: program not found.${C_RESET}\n" >&2
+        echo "Resolved path:" >&2
+        echo "    $resolved" >&2
+        echo "" >&2
+        echo "Check that the file exists and that the path is quoted correctly." >&2
+        return 1
+    fi
+
+    echo "$resolved"
+    return 0
+}
+
+# --- GUI Launch Helper ---
+launch_gui() {
+    if [[ -f "$GUI_SCRIPT" ]] && command_exists python3; then
+        exec python3 "$GUI_SCRIPT" "$@"
+    else
+        die "GUI components not found at $GUI_SCRIPT or python3 missing."
+    fi
+}
+
+# --- CLI Commands ---
+
+# 1. LIST
+cmd_list() {
+    echo -e "${C_BOLD}Running Steam games:${C_RESET}\n"
+
+    local entries=()
+    while IFS=$'\t' read -r appid pid name; do
+        [[ -n "$appid" ]] && entries+=("${appid}|${pid}|${name}")
+    done < <(list_running_games)
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        echo -e "${C_DIM}No running Steam games detected.${C_RESET}"
+        return 0
+    fi
+
+    printf "%-12s %-10s %s\n" "APPID" "PID" "NAME"
+    printf "%-12s %-10s %s\n" "------------" "----------" "----------------------------------------"
+
+    for item in "${entries[@]}"; do
+        local appid="${item%%|*}"
+        local rest="${item#*|}"
+        local pid="${rest%%|*}"
+        local name="${rest#*|}"
+        printf "%-12s %-10s %s\n" "$appid" "$pid" "$name"
+    done
+}
+
+# 2. INFO
+cmd_info() {
+    local appid="${1:-}"
+    [[ -n "$appid" ]] || die "Usage: $SCRIPT_NAME info <APPID>"
+
+    build_game_env "$appid"
+
+    local name
+    name="$(get_game_name "$appid")"
+    local steam_root
+    steam_root="$(get_primary_steam_root 2>/dev/null || echo "Not detected")"
+
+    local status="Not running"
+    if [[ "$IS_GAME_RUNNING" -eq 1 ]]; then
+        status="Running (PID: $RUNNING_PID)"
+    fi
+
+    local proton_display="${PROTON_BIN:-Not detected}"
+    local proton_ver="Unknown"
+    if [[ -n "$PROTON_BIN" && -f "$(dirname "$PROTON_BIN")/version" ]]; then
+        proton_ver="$(cat "$(dirname "$PROTON_BIN")/version" 2>/dev/null || echo "Unknown")"
+    fi
+
+    # Filesystems
+    local game_fs="Unknown"
+    if [[ -d "$ENV_STEAM_COMPAT_INSTALL_PATH" ]]; then
+        game_fs="$(df -T "$ENV_STEAM_COMPAT_INSTALL_PATH" 2>/dev/null | awk 'NR==2 {print $2}')"
+    fi
+
+    local compat_fs="Unknown"
+    if [[ -d "$ENV_STEAM_COMPAT_DATA_PATH" ]]; then
+        compat_fs="$(df -T "$ENV_STEAM_COMPAT_DATA_PATH" 2>/dev/null | awk 'NR==2 {print $2}')"
+    fi
+
+    echo -e "${C_BOLD}Steam AppID:${C_RESET}          $appid"
+    echo -e "${C_BOLD}Game name:${C_RESET}            $name"
+    echo ""
+    echo -e "${C_BOLD}Steam root:${C_RESET}"
+    echo "    $steam_root"
+    echo ""
+    echo -e "${C_BOLD}Game directory:${C_RESET}"
+    echo "    $ENV_STEAM_COMPAT_INSTALL_PATH"
+    echo ""
+    echo -e "${C_BOLD}Compatdata:${C_RESET}"
+    echo "    $ENV_STEAM_COMPAT_DATA_PATH"
+    echo ""
+    echo -e "${C_BOLD}Wine prefix:${C_RESET}"
+    echo "    $ENV_WINEPREFIX"
+    echo ""
+    echo -e "${C_BOLD}Proton:${C_RESET}"
+    echo "    $proton_display"
+    if [[ "$proton_ver" != "Unknown" ]]; then
+        echo "    Version: $proton_ver"
+    fi
+    echo ""
+    echo -e "${C_BOLD}Filesystems:${C_RESET}"
+    echo "    Game directory:   $game_fs"
+    echo "    Compatdata pfx:   $compat_fs"
+    echo ""
+    echo -e "${C_BOLD}Status:${C_RESET}"
+    echo "    $status"
+}
+
+# 3. ENV
+cmd_env() {
+    local appid="${1:-}"
+    [[ -n "$appid" ]] || die "Usage: $SCRIPT_NAME env <APPID>"
+
+    build_game_env "$appid"
+
+    echo "STEAM_COMPAT_APP_ID=$ENV_STEAM_COMPAT_APP_ID"
+    echo "STEAM_COMPAT_DATA_PATH=$ENV_STEAM_COMPAT_DATA_PATH"
+    echo "STEAM_COMPAT_INSTALL_PATH=$ENV_STEAM_COMPAT_INSTALL_PATH"
+    echo "STEAM_COMPAT_CLIENT_INSTALL_PATH=$ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH"
+    echo "STEAM_COMPAT_LIBRARY_PATHS=$ENV_STEAM_COMPAT_LIBRARY_PATHS"
+    echo "WINEPREFIX=$ENV_WINEPREFIX"
+    echo "SteamAppId=$ENV_STEAM_APP_ID"
+    echo "SteamGameId=$ENV_STEAM_GAME_ID"
+    if [[ -n "$ENV_PROTON_LOG" ]]; then
+        echo "PROTON_LOG=$ENV_PROTON_LOG"
+    fi
+    if [[ -n "$ENV_PROTON_LOG_DIR" ]]; then
+        echo "PROTON_LOG_DIR=$ENV_PROTON_LOG_DIR"
+    fi
+    if [[ -n "$ENV_WINEDLLOVERRIDES" ]]; then
+        echo "WINEDLLOVERRIDES=$ENV_WINEDLLOVERRIDES"
+    fi
+    if [[ -n "$PROTON_BIN" ]]; then
+        echo "PROTON_BIN=$PROTON_BIN"
+    fi
+}
+
+# 4. RUN
+cmd_run() {
+    local appid="${1:-}"
+    shift || true
+    local program="${1:-}"
+    shift || true
+    local extra_args=("$@")
+
+    [[ -n "$appid" && -n "$program" ]] || die "Usage: $SCRIPT_NAME run <APPID> <PROGRAM> [ARGS...]"
+
+    build_game_env "$appid"
+    [[ -n "$PROTON_BIN" ]] || die "Proton installation not found for AppID $appid."
+
+    local target_program
+    target_program="$(resolve_program_target "$program")" || exit 1
+
+    # Verify compatdata exists
+    if [[ ! -d "$ENV_STEAM_COMPAT_DATA_PATH" ]]; then
+        warn "Compatdata directory does not exist yet: $ENV_STEAM_COMPAT_DATA_PATH"
+        warn "Proton will create/initialize the prefix."
+    fi
+
+    # Set up environment
+    export STEAM_COMPAT_APP_ID="$ENV_STEAM_COMPAT_APP_ID"
+    export STEAM_COMPAT_DATA_PATH="$ENV_STEAM_COMPAT_DATA_PATH"
+    export STEAM_COMPAT_INSTALL_PATH="$ENV_STEAM_COMPAT_INSTALL_PATH"
+    export STEAM_COMPAT_CLIENT_INSTALL_PATH="$ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH"
+    export STEAM_COMPAT_LIBRARY_PATHS="$ENV_STEAM_COMPAT_LIBRARY_PATHS"
+    export WINEPREFIX="$ENV_WINEPREFIX"
+    export SteamAppId="$ENV_STEAM_APP_ID"
+    export SteamGameId="$ENV_STEAM_GAME_ID"
+
+    if [[ -n "$ENV_PROTON_LOG" ]]; then
+        export PROTON_LOG="$ENV_PROTON_LOG"
+    fi
+    if [[ -n "$ENV_PROTON_LOG_DIR" ]]; then
+        export PROTON_LOG_DIR="$ENV_PROTON_LOG_DIR"
+    fi
+    if [[ -n "$ENV_WINEDLLOVERRIDES" ]]; then
+        export WINEDLLOVERRIDES="$ENV_WINEDLLOVERRIDES"
+    fi
+
+    # Execute via Proton run
+    exec "$PROTON_BIN" run "$target_program" "${extra_args[@]}"
+}
+
+# 5. CMD
+cmd_cmd() {
+    local appid="${1:-}"
+    [[ -n "$appid" ]] || die "Usage: $SCRIPT_NAME cmd <APPID>"
+
+    build_game_env "$appid"
+    [[ -n "$PROTON_BIN" ]] || die "Proton installation not found for AppID $appid."
+
+    export STEAM_COMPAT_APP_ID="$ENV_STEAM_COMPAT_APP_ID"
+    export STEAM_COMPAT_DATA_PATH="$ENV_STEAM_COMPAT_DATA_PATH"
+    export STEAM_COMPAT_INSTALL_PATH="$ENV_STEAM_COMPAT_INSTALL_PATH"
+    export STEAM_COMPAT_CLIENT_INSTALL_PATH="$ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH"
+    export STEAM_COMPAT_LIBRARY_PATHS="$ENV_STEAM_COMPAT_LIBRARY_PATHS"
+    export WINEPREFIX="$ENV_WINEPREFIX"
+    export SteamAppId="$ENV_STEAM_APP_ID"
+    export SteamGameId="$ENV_STEAM_GAME_ID"
+
+    exec "$PROTON_BIN" run cmd.exe
+}
+
+# 6. WINE
+cmd_wine() {
+    local appid="${1:-}"
+    shift || true
+    local wine_cmd="${1:-}"
+    shift || true
+    local extra_args=("$@")
+
+    [[ -n "$appid" && -n "$wine_cmd" ]] || die "Usage: $SCRIPT_NAME wine <APPID> <COMMAND> [ARGS...]"
+
+    build_game_env "$appid"
+    [[ -n "$PROTON_BIN" ]] || die "Proton installation not found for AppID $appid."
+
+    export STEAM_COMPAT_APP_ID="$ENV_STEAM_COMPAT_APP_ID"
+    export STEAM_COMPAT_DATA_PATH="$ENV_STEAM_COMPAT_DATA_PATH"
+    export STEAM_COMPAT_INSTALL_PATH="$ENV_STEAM_COMPAT_INSTALL_PATH"
+    export STEAM_COMPAT_CLIENT_INSTALL_PATH="$ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH"
+    export STEAM_COMPAT_LIBRARY_PATHS="$ENV_STEAM_COMPAT_LIBRARY_PATHS"
+    export WINEPREFIX="$ENV_WINEPREFIX"
+    export SteamAppId="$ENV_STEAM_APP_ID"
+    export SteamGameId="$ENV_STEAM_GAME_ID"
+
+    # Use Proton's runinprefix verb to execute Wine commands safely
+    exec "$PROTON_BIN" runinprefix "$wine_cmd" "${extra_args[@]}"
+}
+
+# 7. NATIVE
+cmd_native() {
+    local appid="${1:-}"
+    shift || true
+    local native_cmd="${1:-}"
+    shift || true
+    local extra_args=("$@")
+
+    [[ -n "$appid" && -n "$native_cmd" ]] || die "Usage: $SCRIPT_NAME native <APPID> <COMMAND> [ARGS...]"
+
+    build_game_env "$appid"
+
+    export STEAM_COMPAT_APP_ID="$ENV_STEAM_COMPAT_APP_ID"
+    export STEAM_COMPAT_DATA_PATH="$ENV_STEAM_COMPAT_DATA_PATH"
+    export STEAM_COMPAT_INSTALL_PATH="$ENV_STEAM_COMPAT_INSTALL_PATH"
+    export STEAM_COMPAT_CLIENT_INSTALL_PATH="$ENV_STEAM_COMPAT_CLIENT_INSTALL_PATH"
+    export STEAM_COMPAT_LIBRARY_PATHS="$ENV_STEAM_COMPAT_LIBRARY_PATHS"
+    export WINEPREFIX="$ENV_WINEPREFIX"
+    export SteamAppId="$ENV_STEAM_APP_ID"
+    export SteamGameId="$ENV_STEAM_GAME_ID"
+
+    if [[ -n "$ENV_PROTON_LOG" ]]; then
+        export PROTON_LOG="$ENV_PROTON_LOG"
+    fi
+    if [[ -n "$ENV_PROTON_LOG_DIR" ]]; then
+        export PROTON_LOG_DIR="$ENV_PROTON_LOG_DIR"
+    fi
+    if [[ -n "$ENV_WINEDLLOVERRIDES" ]]; then
+        export WINEDLLOVERRIDES="$ENV_WINEDLLOVERRIDES"
+    fi
+
+    exec "$native_cmd" "${extra_args[@]}"
+}
+
+# 8. DOCTOR
+cmd_doctor() {
+    local appid="${1:-}"
+
+    echo -e "${C_BOLD}Proton Runner Diagnostic Report${C_RESET}"
+    echo "================================"
+
+    # 1. Check Bash version
+    local bash_ver="${BASH_VERSION:-Unknown}"
+    if [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]]; then
+        echo -e "  [${C_GREEN}OK${C_RESET}] Bash version: $bash_ver"
+    else
+        echo -e "  [${C_YELLOW}WARN${C_RESET}] Bash version $bash_ver (recommended: 4.0+)"
+    fi
+
+    # 2. Check Core CLI tools
+    local missing_tools=()
+    for tool in awk sed grep find readlink ps pgrep realpath df; do
+        if ! command_exists "$tool"; then
+            missing_tools+=("$tool")
+        fi
+    done
+    if [[ ${#missing_tools[@]} -eq 0 ]]; then
+        echo -e "  [${C_GREEN}OK${C_RESET}] Core system utilities available"
+    else
+        echo -e "  [${C_RED}FAIL${C_RESET}] Missing required tools: ${missing_tools[*]}"
+    fi
+
+    # 3. Steam Installation
+    local steam_root
+    steam_root="$(get_primary_steam_root 2>/dev/null || true)"
+    if [[ -n "$steam_root" && -d "$steam_root" ]]; then
+        echo -e "  [${C_GREEN}OK${C_RESET}] Steam installation detected: $steam_root"
+    else
+        echo -e "  [${C_RED}FAIL${C_RESET}] Steam installation directory not found"
+    fi
+
+    # 4. Steam Libraries
+    local libs=()
+    while IFS= read -r l; do
+        [[ -n "$l" ]] && libs+=("$l")
+    done < <(find_steam_libraries)
+
+    if [[ ${#libs[@]} -gt 0 ]]; then
+        echo -e "  [${C_GREEN}OK${C_RESET}] Steam libraries detected (${#libs[@]} found):"
+        for l in "${libs[@]}"; do
+            echo "       - $l"
+        done
+    else
+        echo -e "  [${C_YELLOW}WARN${C_RESET}] No Steam library folders detected"
+    fi
+
+    # 5. Steam Linux Runtime
+    local slr_path
+    slr_path="$(find_steam_linux_runtime 2>/dev/null || true)"
+    if [[ -n "$slr_path" ]]; then
+        echo -e "  [${C_GREEN}OK${C_RESET}] Steam Linux Runtime container detected: $(basename "$slr_path")"
+    else
+        echo -e "  [${C_YELLOW}WARN${C_RESET}] Steam Linux Runtime container environment not detected in common libraries"
+    fi
+
+    # 6. Global or App-specific Proton
+    if [[ -z "$appid" ]]; then
+        local global_proton
+        global_proton="$(find_proton "" 2>/dev/null || true)"
+        if [[ -n "$global_proton" ]]; then
+            echo -e "  [${C_GREEN}OK${C_RESET}] Default Proton installation detected: $global_proton"
+        else
+            echo -e "  [${C_YELLOW}WARN${C_RESET}] No Proton installations detected in standard compatibility directories"
+        fi
+    else
+        echo ""
+        echo -e "${C_BOLD}AppID $appid Diagnostics:${C_RESET}"
+        echo "--------------------------------"
+
+        build_game_env "$appid"
+
+        # Manifest
+        local manifest
+        manifest="$(find_app_manifest "$appid" 2>/dev/null || true)"
+        if [[ -n "$manifest" ]]; then
+            local gname
+            gname="$(get_game_name "$appid")"
+            echo -e "  [${C_GREEN}OK${C_RESET}] AppID exists in Steam library: $gname"
+        else
+            echo -e "  [${C_YELLOW}WARN${C_RESET}] App manifest for AppID $appid not found in known libraries"
+        fi
+
+        # Game install path
+        if [[ -d "$ENV_STEAM_COMPAT_INSTALL_PATH" ]]; then
+            echo -e "  [${C_GREEN}OK${C_RESET}] Game installation detected: $ENV_STEAM_COMPAT_INSTALL_PATH"
+            # Filesystem check
+            local g_fs
+            g_fs="$(df -T "$ENV_STEAM_COMPAT_INSTALL_PATH" 2>/dev/null | awk 'NR==2 {print $2}')"
+            if [[ "$g_fs" =~ ^(ntfs|fuseblk|vfat|exfat)$ ]]; then
+                echo -e "       [${C_YELLOW}WARN${C_RESET}] Game filesystem is $g_fs. NTFS drives may require specific mount options (uid, gid, fmask, dmask) for Proton compatibility."
+            else
+                echo -e "       Filesystem: $g_fs"
+            fi
+        else
+            echo -e "  [${C_YELLOW}WARN${C_RESET}] Game installation directory not found: $ENV_STEAM_COMPAT_INSTALL_PATH"
+        fi
+
+        # Compatdata
+        if [[ -d "$ENV_STEAM_COMPAT_DATA_PATH" ]]; then
+            echo -e "  [${C_GREEN}OK${C_RESET}] Compatdata directory exists: $ENV_STEAM_COMPAT_DATA_PATH"
+            # Permissions check
+            if [[ -w "$ENV_STEAM_COMPAT_DATA_PATH" ]]; then
+                echo -e "       [${C_GREEN}OK${C_RESET}] Compatdata is writable by user $(whoami)"
+            else
+                echo -e "       [${C_RED}FAIL${C_RESET}] Compatdata is NOT writable by current user! Check permissions."
+            fi
+
+            # Filesystem check
+            local c_fs
+            c_fs="$(df -T "$ENV_STEAM_COMPAT_DATA_PATH" 2>/dev/null | awk 'NR==2 {print $2}')"
+            if [[ "$c_fs" =~ ^(ntfs|fuseblk|vfat|exfat)$ ]]; then
+                echo -e "       [${C_YELLOW}WARN${C_RESET}] Compatdata filesystem is $c_fs. Storing Wine prefixes on NTFS often leads to symlink failures or corruption."
+            else
+                echo -e "       Filesystem: $c_fs"
+            fi
+        else
+            echo -e "  [${C_YELLOW}WARN${C_RESET}] Compatdata directory does not exist yet: $ENV_STEAM_COMPAT_DATA_PATH"
+        fi
+
+        # Wine prefix
+        if [[ -d "$ENV_WINEPREFIX" ]]; then
+            echo -e "  [${C_GREEN}OK${C_RESET}] Wine prefix exists: $ENV_WINEPREFIX"
+        else
+            echo -e "  [${C_YELLOW}WARN${C_RESET}] Wine prefix does not exist yet: $ENV_WINEPREFIX"
+        fi
+
+        # Proton tool
+        if [[ -n "$PROTON_BIN" && -x "$PROTON_BIN" ]]; then
+            echo -e "  [${C_GREEN}OK${C_RESET}] Proton executable detected: $PROTON_BIN"
+        else
+            echo -e "  [${C_RED}FAIL${C_RESET}] Proton executable not found for AppID $appid"
+        fi
+
+        # Running process
+        if [[ "$IS_GAME_RUNNING" -eq 1 ]]; then
+            echo -e "  [${C_GREEN}OK${C_RESET}] Running game process detected (PID: $RUNNING_PID)"
+        else
+            echo -e "  [${C_BLUE}INFO${C_RESET}] Game is currently not running (environment will be reconstructed)"
+        fi
+
+        # Launch Options Note
+        echo ""
+        echo -e "${C_BOLD}Steam Launch Options Diagnostic:${C_RESET}"
+        echo "  If you want custom environment variables (e.g., PROTON_LOG=1) applied by Steam,"
+        echo "  configure them in Steam Game Properties -> Launch Options:"
+        echo "      PROTON_LOG=1 %command%"
+    fi
+
+    # 7. PATH Diagnostic
+    echo ""
+    echo -e "${C_BOLD}PATH Environment:${C_RESET}"
+    echo "  Current Shell PATH:"
+    echo "      $PATH"
+    local live_path="${ACTIVE_ENV["PATH"]:-}"
+    if [[ -n "$live_path" ]]; then
+        echo "  Steam Live Game Process PATH:"
+        echo "      $live_path"
+    fi
+}
+
+# 9. HELP
+cmd_help() {
+    cat <<EOF
+Proton Runner $VERSION
+
+Run programs inside a Steam game's Proton environment (CLI & GUI).
+
+Usage:
+  $SCRIPT_NAME [gui]
+  $SCRIPT_NAME list
+  $SCRIPT_NAME info <APPID>
+  $SCRIPT_NAME env <APPID>
+  $SCRIPT_NAME run <APPID> <PROGRAM> [ARGS...]
+  $SCRIPT_NAME cmd <APPID>
+  $SCRIPT_NAME wine <APPID> <COMMAND> [ARGS...]
+  $SCRIPT_NAME native <APPID> <COMMAND> [ARGS...]
+  $SCRIPT_NAME doctor [APPID]
+  $SCRIPT_NAME --help | help
+  $SCRIPT_NAME --version
+
+Commands:
+  gui                   Launch the Qt6 graphical desktop application (default in desktop mode).
+  list                  List currently running Steam games and AppIDs.
+  info <APPID>          Display Steam paths, prefix, Proton version, and status.
+  env <APPID>           Print the Proton environment variables for the game.
+  run <APPID> <PROG>    Run a Windows executable inside the game's Proton environment.
+  cmd <APPID>           Open an interactive Windows command prompt (cmd.exe) in the prefix.
+  wine <APPID> <CMD>    Run Wine commands (e.g. winecfg, regedit, explorer.exe) inside prefix.
+  native <APPID> <CMD>  Run a native Linux command using the Steam/Proton environment.
+  doctor [APPID]        Diagnose Steam installation, Proton tools, and filesystem health.
+
+Examples:
+  $SCRIPT_NAME gui
+  $SCRIPT_NAME list
+  $SCRIPT_NAME info 3513350
+  $SCRIPT_NAME env 3513350
+  $SCRIPT_NAME run 3513350 ~/Tools/mod_manager.exe
+  $SCRIPT_NAME run 3513350 "C:\\Tools\\debug.exe" --arg1
+  $SCRIPT_NAME cmd 3513350
+  $SCRIPT_NAME wine 3513350 winecfg
+  $SCRIPT_NAME wine 3513350 regedit
+  $SCRIPT_NAME native 3513350 bash
+  $SCRIPT_NAME doctor 3513350
+
+PATH Configuration & Installation:
+  To install $SCRIPT_NAME for your user:
+    mkdir -p ~/.local/bin
+    cp proton-runner proton_runner_gui.py ~/.local/bin/
+    chmod +x ~/.local/bin/proton-runner ~/.local/bin/proton_runner_gui.py
+
+  Ensure ~/.local/bin is in your PATH:
+    For Bash (~/.bashrc):
+      export PATH="\$HOME/.local/bin:\$PATH"
+    For Zsh (~/.zshrc):
+      export PATH="\$HOME/.local/bin:\$PATH"
+    For Fish:
+      fish_add_path ~/.local/bin
+EOF
+}
+
+cmd_version() {
+    echo "proton-runner $VERSION"
+}
+
+# --- Main Entrypoint ---
+main() {
+    if [[ $# -eq 0 ]]; then
+        if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" ]]; then
+            launch_gui
+        else
+            cmd_help
+        fi
+        exit 0
+    fi
+
+    local action="$1"
+    shift
+
+    case "$action" in
+        gui)
+            launch_gui "$@"
+            ;;
+        list)
+            cmd_list "$@"
+            ;;
+        info)
+            cmd_info "$@"
+            ;;
+        env)
+            cmd_env "$@"
+            ;;
+        run)
+            cmd_run "$@"
+            ;;
+        cmd)
+            cmd_cmd "$@"
+            ;;
+        wine)
+            cmd_wine "$@"
+            ;;
+        native)
+            cmd_native "$@"
+            ;;
+        doctor)
+            cmd_doctor "$@"
+            ;;
+        --help|-h|help)
+            cmd_help
+            ;;
+        --version|-v|version)
+            cmd_version
+            ;;
+        *)
+            die "Unknown command '$action'. Run '$SCRIPT_NAME --help' for usage instructions."
+            ;;
+    esac
+}
+
+main "$@"

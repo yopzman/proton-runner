@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Proton Runner
+Comment=Run Windows and Linux applications inside Steam Proton game environments
+Exec=proton-runner gui
+Icon=steam
+Terminal=false
+Type=Application
+Categories=Game;Utility;Development;
+Keywords=steam;proton;wine;runner;mod;prefix;
+StartupNotify=true
