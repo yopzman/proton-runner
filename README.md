@@ -117,3 +117,7 @@ Proton requires specific environment variables to target a prefix correctly:
 When a game is running, `proton-runner` reads these exact values directly from the running process environment. When offline, it discovers them via Steam configuration files (`config.vdf`, `libraryfolders.vdf`, `appmanifest_<appid>.acf`) and `config_info`.
 
 ---
+
+## License
+
+MIT
